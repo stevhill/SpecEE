@@ -4,6 +4,7 @@ import re
 from typing import Optional
 import torch
 import json
+import gc
 from EE_model import EEModel
 from model_llama_ee import MLP
 
@@ -35,12 +36,13 @@ def load_questions(question_file: str, begin: Optional[int], end: Optional[int])
     return questions
 
 def main(args):
+    torch.set_grad_enabled(False)  # globally disable gradient tracking for all inference paths
     model = EEModel.from_pretrained(
         base_model_path=args.base_model_path,
         ea_model_path=args.draft_model_path,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
-        device_map="auto",
+        device_map="auto",  # intelligent CPU/GPU placement to fit in memory
         attn_implementation="eager",
         predictor_path=args.predictor_path,
         pred_thresholds = args.pred_thresholds,
@@ -54,6 +56,10 @@ def main(args):
         question_list = load_questions('./benchmark/'+args.dataset+'/question.jsonl',begin=0,end=80)
         exit_layer_id_list=[]
         output_ids_tot = 0
+        ee_head_time_total = 0.0  # accumulate early-exit head time
+        draft_time_total = 0.0  # accumulate EAGLE draft-model time
+        ee_head_calls = 0  # count early-exit head calls
+        ee_total_time = 0.0  # accumulate total model time
         st = time.time()
         torch.cuda.empty_cache()
         for i in trange(len(question_list)):
@@ -68,15 +74,28 @@ def main(args):
             seqlen = len(input_ids[0])
             input_ids = torch.as_tensor(input_ids).cuda()
             output_ids=model(input_ids,max_new_tokens=256,exit_layer_id_list=exit_layer_id_list)
+            if hasattr(model, "last_timing"):  # check for timing payload
+                ee_head_time_total += model.last_timing.get("ee_head_time_s", 0.0)  # sum head time
+                ee_head_calls += model.last_timing.get("ee_head_calls", 0)  # sum head calls
+                draft_time_total += model.last_timing.get("draft_time_s", 0.0)  # sum draft-model time
+                ee_total_time += model.last_timing.get("total_time_s", 0.0)  # sum total time
             output_ids_tot += len(output_ids[0]) - seqlen
             output=model.tokenizer.decode(output_ids[0])
         ed = time.time()
         spec = output_ids_tot/(ed-st)
         print('SpecEE '+ args.dataset + ' tokens per second :  ',spec)
-        # print('average layer :  ',sum(exit_layer_id_list)/len(exit_layer_id_list))     
+        if ee_total_time > 0:  # avoid divide by zero
+            ee_percent = (ee_head_time_total / ee_total_time) * 100.0  # compute head share
+            draft_percent = (draft_time_total / ee_total_time) * 100.0  # compute draft-model share
+            print('SpecEE early-exit head time (% of model runtime): ', f"{ee_percent:.2f}%")  # report percent
+            print('SpecEE average number of early exit runs per token: ', ee_head_calls/len(exit_layer_id_list))
+            print('SpecEE EAGLE draft model time (% of model runtime): ', f"{draft_percent:.2f}%")  # report percent
+        print('average layer :  ',sum(exit_layer_id_list)/len(exit_layer_id_list))     
+        del model  # free SpecEE model memory before loading HF baseline
+        gc.collect()  # force cleanup of Python references to release VRAM sooner
         torch.cuda.empty_cache()
         tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
-        model = AutoModelForCausalLM.from_pretrained(args.base_model_path,torch_dtype=torch.float16,device_map="auto",attn_implementation="eager",low_cpu_mem_usage=True)
+        model = AutoModelForCausalLM.from_pretrained(args.base_model_path,torch_dtype=torch.float16,device_map="auto",attn_implementation="eager",low_cpu_mem_usage=True)  # intelligent CPU/GPU placement
         model.eval()
         output_ids_tot = 0
         torch.cuda.empty_cache()
@@ -93,7 +112,13 @@ def main(args):
             input_ids=tokenizer([prompt]).input_ids
             seqlen = len(input_ids[0])
             input_ids = torch.as_tensor(input_ids).cuda()
-            output_ids=model.generate(input_ids,max_new_tokens=256,do_sample=False)
+            output_ids = model.generate(  # HF baseline generation
+                input_ids,  # prompt tokens
+                max_new_tokens=256,  # match SpecEE generation length
+                do_sample=False,  # deterministic decoding
+                temperature=1.0,  # avoid sampling warnings when do_sample is False
+                top_p=1.0,  # avoid sampling warnings when do_sample is False
+            )  # end HF baseline generation
             output_ids_tot += len(output_ids[0]) - seqlen
             output=tokenizer.decode(output_ids[0])
         ed = time.time()
@@ -108,6 +133,7 @@ def main(args):
         if args.dataset == 'commonsenseqa':
             file_path = "./benchmark/commonsense_qa/data/validation-00000-of-00001.parquet"
             dataset = pq.read_table(file_path).to_pandas()
+            model.eval()  # ensure inference-only behavior for SpecEE model
             correct = 0
             total = 0
             exit_layer_id_list=[]
@@ -135,7 +161,7 @@ def main(args):
             print(f"SpecEE Model's accuracy on comonsenseqa is: {accuracy:.2%}")
             torch.cuda.empty_cache()
             tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
-            model = AutoModelForCausalLM.from_pretrained(args.base_model_path,torch_dtype=torch.float16,device_map="auto",attn_implementation="eager",low_cpu_mem_usage=True)
+            model = AutoModelForCausalLM.from_pretrained(args.base_model_path,torch_dtype=torch.float16,device_map="auto",attn_implementation="eager",low_cpu_mem_usage=True)  # intelligent CPU/GPU placement
             model.eval()
             correct = 0
             total = 0
@@ -148,7 +174,13 @@ def main(args):
                 prompt = get_commonsenseqa_prompt(question,options,answers)
                 input_ids=tokenizer([prompt]).input_ids
                 input_ids = torch.as_tensor(input_ids).cuda()
-                output_ids=model.generate(input_ids,max_new_tokens=3,temperature=1e-6)
+                output_ids = model.generate(  # HF baseline generation
+                    input_ids,  # prompt tokens
+                    max_new_tokens=3,  # short answer length
+                    do_sample=False,  # deterministic decoding
+                    temperature=1.0,  # avoid sampling warnings when do_sample is False
+                    top_p=1.0,  # avoid sampling warnings when do_sample is False
+                )  # end HF baseline generation
                 generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
                 answer_start_index = len(prompt+"Answer:")     
                 try:
@@ -194,7 +226,7 @@ def main(args):
             print("SpecEE Model's accuracy on sst2 is: ",correct/total)
             torch.cuda.empty_cache()
             tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
-            model = AutoModelForCausalLM.from_pretrained(args.base_model_path,torch_dtype=torch.float16,device_map="auto",attn_implementation="eager",low_cpu_mem_usage=True)
+            model = AutoModelForCausalLM.from_pretrained(args.base_model_path,torch_dtype=torch.float16,device_map="auto",attn_implementation="eager",low_cpu_mem_usage=True)  # intelligent CPU/GPU placement
             model.eval()
             correct = 0
             total = 0
@@ -206,7 +238,13 @@ def main(args):
                 inputs = tokenizer(prompt, return_tensors="pt").input_ids
                 input_ids = torch.as_tensor(inputs).cuda()
                 seqlen = len(inputs[0])
-                outputs = model.generate(input_ids, max_new_tokens=3,temperature=1e-6)
+                outputs = model.generate(  # HF baseline generation
+                    input_ids,  # prompt tokens
+                    max_new_tokens=3,  # short answer length
+                    do_sample=False,  # deterministic decoding
+                    temperature=1.0,  # avoid sampling warnings when do_sample is False
+                    top_p=1.0,  # avoid sampling warnings when do_sample is False
+                )  # end HF baseline generation
                 output_ids_tot += len(outputs[0]) - seqlen
                 generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 ed = time.time()

@@ -565,6 +565,7 @@ class Model(nn.Module):
     @torch.no_grad()
     def topK_genrate(self, hidden_states, input_ids, head):
         # if input_ids.shape[-1] > 1:
+        # Speculative head: project only top-k candidate tokens to reduce predictor search space.
         input_ids = input_ids[:, 1:]
         input_ids = input_ids.to(hidden_states.device)
     

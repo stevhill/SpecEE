@@ -1,0 +1,7 @@
+__pycache__/
+/SpecEE_cloud/EAGLE-llama2-chat-7B/
+SpecEE_cloud/__pycache__/accuracy_prompt.cpython-310.pyc
+SpecEE_cloud/__pycache__/cnets.cpython-310.pyc
+SpecEE_cloud/__pycache__/configs.cpython-310.pyc
+SpecEE_cloud/__pycache__/EE_model.cpython-310.pyc
+SpecEE_cloud/__pycache__/model_llama_ee.cpython-310.pyc

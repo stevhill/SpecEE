@@ -988,7 +988,26 @@ class LlamaModel(LlamaPreTrainedModel):
         self.layers_count = []
         self.predictors = None
         self.pred_thresholds = 0.5
+        self.ee_timing = {"head_time_s": 0.0, "head_calls": 0}  # track early-exit head time/calls
+        self.ee_timing_enabled = True  # allow toggling head timing
         self.post_init()
+
+    def reset_ee_timing(self):  # reset early-exit timing counters
+        self.ee_timing["head_time_s"] = 0.0  # clear accumulated head time
+        self.ee_timing["head_calls"] = 0  # clear head call count
+
+    def _record_ee_head_time(self, start_time):  # record per-head duration
+        if not self.ee_timing_enabled:  # skip timing when disabled
+            return  # skip timing when disabled
+        if isinstance(start_time, tuple):  # CUDA event timing path
+            start_event, end_event = start_time  # unpack CUDA timing events
+            end_event.record()  # mark end of timed CUDA region
+            end_event.synchronize()  # wait for end event completion
+            elapsed_s = start_event.elapsed_time(end_event) / 1000.0  # convert ms to seconds
+        else:  # CPU fallback timing path
+            elapsed_s = time.perf_counter() - start_time  # compute elapsed wall time
+        self.ee_timing["head_time_s"] += elapsed_s  # accumulate head time
+        self.ee_timing["head_calls"] += 1  # count head invocation
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1082,7 +1101,8 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
         last_prob = None
-        dynamic_layers = [15,16,17,19,21,24,26,28]
+        # Heuristic predictor scheduling: fixed offline set + online context-nearby exits.
+        dynamic_layers = [15, 16, 17, 19, 21, 24, 26, 28]  # fixed offline predictors
         if len(exit_layer_id_list) >= 5:
             for x in exit_layer_id_list[-5:]:
                 for y in [-2,0,2]:
@@ -1123,6 +1143,15 @@ class LlamaModel(LlamaPreTrainedModel):
             if not init and idx <= len(self.layers):
                 if idx not in layer_selected:
                     continue
+                # Speculative early-exit head: compute draft logits/prob/variation, run per-layer MLP, then verify.
+                ee_start = None  # default timing sentinel
+                if self.ee_timing_enabled and True:  # timing guard
+                    if hidden_states.is_cuda:  # use CUDA events when running on GPU
+                        ee_start_event = torch.cuda.Event(enable_timing=True)  # create start timing event
+                        ee_end_event = torch.cuda.Event(enable_timing=True)  # create end timing event
+                        ee_start_event.record()  # record start event on current stream
+                        ee_start = (ee_start_event, ee_end_event)  # pass event pair to recorder
+                
                 hidden_states_tmp = self.norm(hidden_states)
                 draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
                 draft_prob = F.softmax(draft_logits, dim=-1)
@@ -1135,14 +1164,30 @@ class LlamaModel(LlamaPreTrainedModel):
                     feature = torch.cat([draft_logits,draft_prob,prob_gap],dim=-1).squeeze(0)
                 else:
                     feature = torch.cat([hidden_states_tmp,draft_logits,draft_prob],dim=-1).squeeze(0)
+                
+                if self.ee_timing_enabled and False:  # timing guard
+                    if hidden_states.is_cuda:  # use CUDA events when running on GPU
+                        ee_start_event = torch.cuda.Event(enable_timing=True)  # create start timing event
+                        ee_end_event = torch.cuda.Event(enable_timing=True)  # create end timing event
+                        ee_start_event.record()  # record start event on current stream
+                        ee_start = (ee_start_event, ee_end_event)  # pass event pair to recorder
+                
+                
                 pred = self.predictors[idx](feature)
+
+                #if ee_start is not None:  # timing guard for early exit
+                #    self._record_ee_head_time(ee_start) 
+
                 if pred > self.pred_thresholds:
                     logits = lm_head(hidden_states_tmp)
                     token = torch.argmax(logits[:, -1])
                     token = token[None, None]
                     # if token == input_ids[-1]:
-                    #     continue
+                    #     continue 
+                    if ee_start is not None:  # timing guard for early exit
+                            self._record_ee_head_time(ee_start)  # record head time on early exit
                     if token in draft_token_index:
+
                         exit_layer_id_list.append(idx+1)
                         hidden_states = hidden_states_tmp
                         if output_hidden_states:
@@ -1158,6 +1203,9 @@ class LlamaModel(LlamaPreTrainedModel):
                             hidden_states=all_hidden_states,
                             attentions=all_self_attns,
                         ), token
+                else:
+                    if ee_start is not None:  # timing guard for non-exit path
+                        self._record_ee_head_time(ee_start)  # record head time on non-exit path
         hidden_states = self.norm(hidden_states)
         logits = lm_head(hidden_states)
         token = torch.argmax(logits[:, -1])

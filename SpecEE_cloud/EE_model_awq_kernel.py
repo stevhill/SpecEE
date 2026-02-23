@@ -99,6 +99,7 @@ class EEModel(nn.Module):
             past_key_values = outputs[1]
             token = token.to(input_ids.device)
             input_ids = torch.cat((input_ids, token), dim=1)
+            # EAGLE draft model execution: runs ea_layer to compute draft top-k proposals/head.
             topk_index, topk_prob, top_head_weight = self.ea_layer.topK_genrate(hidden_states, input_ids, self.base_model.model.lm_head)
             for _ in range(max_new_tokens - 1):
                 outputs,token = self.base_model.model.model(input_ids=token,is_causal = True,init=False,draft_lm_head_weight = top_head_weight,draft_token_index = topk_index,lm_head = self.base_model.model.lm_head,exit_layer_id_list = exit_layer_id_list)
@@ -106,6 +107,7 @@ class EEModel(nn.Module):
                 past_key_values = outputs[1]
                 input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
 
+                # EAGLE draft model execution at each decode step (refreshes draft candidates for next token).
                 topk_index, topk_prob, top_head_weight = self.ea_layer.topK_genrate(hidden_states, input_ids, self.base_model.model.lm_head)
                 if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
                     return input_ids
