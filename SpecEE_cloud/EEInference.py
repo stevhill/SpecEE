@@ -46,6 +46,10 @@ def main(args):
         attn_implementation="eager",
         predictor_path=args.predictor_path,
         pred_thresholds = args.pred_thresholds,
+        ee_parallel_enabled=args.ee_parallel,
+        ee_timing_mode=args.ee_timing_mode,
+        ee_parallel_clone_cache=False,
+        ee_debug_stats=args.ee_debug_stats,
         # is_offload = False,
         # skip_model = "/home/xujiaming/xujiaming/research/ASPLOS-24/skip_layer/model.txt",
     )
@@ -60,6 +64,14 @@ def main(args):
         draft_time_total = 0.0  # accumulate EAGLE draft-model time
         ee_head_calls = 0  # count early-exit head calls
         ee_total_time = 0.0  # accumulate total model time
+        ee_debug_totals = {
+            "selected_layers": 0,
+            "pred_pass": 0,
+            "token_match": 0,
+            "early_exit": 0,
+            "prefetch_launch": 0,
+            "prefetch_consume": 0,
+        }
         st = time.time()
         torch.cuda.empty_cache()
         for i in trange(len(question_list)):
@@ -73,12 +85,23 @@ def main(args):
             input_ids=model.tokenizer([prompt]).input_ids
             seqlen = len(input_ids[0])
             input_ids = torch.as_tensor(input_ids).cuda()
-            output_ids=model(input_ids,max_new_tokens=256,exit_layer_id_list=exit_layer_id_list)
+            output_ids=model(
+                input_ids,
+                max_new_tokens=256,
+                exit_layer_id_list=exit_layer_id_list,
+                ee_parallel_enabled=args.ee_parallel,
+                ee_timing_mode=args.ee_timing_mode,
+                ee_debug_stats=args.ee_debug_stats,
+            )
             if hasattr(model, "last_timing"):  # check for timing payload
                 ee_head_time_total += model.last_timing.get("ee_head_time_s", 0.0)  # sum head time
                 ee_head_calls += model.last_timing.get("ee_head_calls", 0)  # sum head calls
                 draft_time_total += model.last_timing.get("draft_time_s", 0.0)  # sum draft-model time
                 ee_total_time += model.last_timing.get("total_time_s", 0.0)  # sum total time
+                if args.ee_debug_stats:
+                    ee_debug = model.last_timing.get("ee_debug", {})
+                    for key in ee_debug_totals:
+                        ee_debug_totals[key] += int(ee_debug.get(key, 0))
             output_ids_tot += len(output_ids[0]) - seqlen
             output=model.tokenizer.decode(output_ids[0])
         ed = time.time()
@@ -90,6 +113,8 @@ def main(args):
             print('SpecEE early-exit head time (% of model runtime): ', f"{ee_percent:.2f}%")  # report percent
             print('SpecEE average number of early exit runs per token: ', ee_head_calls/len(exit_layer_id_list))
             print('SpecEE EAGLE draft model time (% of model runtime): ', f"{draft_percent:.2f}%")  # report percent
+            if args.ee_debug_stats:
+                print('SpecEE gate stats: ', ee_debug_totals)
         print('average layer :  ',sum(exit_layer_id_list)/len(exit_layer_id_list))     
         del model  # free SpecEE model memory before loading HF baseline
         gc.collect()  # force cleanup of Python references to release VRAM sooner
@@ -146,7 +171,14 @@ def main(args):
                 prompt = get_commonsenseqa_prompt(question,options,answers)
                 input_ids=model.tokenizer([prompt]).input_ids
                 input_ids = torch.as_tensor(input_ids).cuda()
-                output_ids=model(input_ids,max_new_tokens=3,exit_layer_id_list=exit_layer_id_list)
+                output_ids=model(
+                    input_ids,
+                    max_new_tokens=3,
+                    exit_layer_id_list=exit_layer_id_list,
+                    ee_parallel_enabled=args.ee_parallel,
+                    ee_timing_mode=args.ee_timing_mode,
+                    ee_debug_stats=args.ee_debug_stats,
+                )
                 generated_text = model.tokenizer.decode(output_ids[0], skip_special_tokens=True)
                 answer_start_index = len(prompt+"Answer:")     
                 try:
@@ -210,7 +242,14 @@ def main(args):
                 inputs = model.tokenizer(prompt, return_tensors="pt").input_ids
                 input_ids = torch.as_tensor(inputs).cuda()
                 seqlen = len(inputs[0])
-                outputs = model(input_ids, max_new_tokens=3,exit_layer_id_list=exit_layer_id_list)
+                outputs = model(
+                    input_ids,
+                    max_new_tokens=3,
+                    exit_layer_id_list=exit_layer_id_list,
+                    ee_parallel_enabled=args.ee_parallel,
+                    ee_timing_mode=args.ee_timing_mode,
+                    ee_debug_stats=args.ee_debug_stats,
+                )
                 output_ids_tot += len(outputs[0]) - seqlen
                 generated_text = model.tokenizer.decode(outputs[0], skip_special_tokens=True)
                 ed = time.time()
@@ -272,6 +311,9 @@ if __name__ == "__main__":
     parser.add_argument("--predictor-path", type=str, default="")
     parser.add_argument("--model-size", type=str,choices=['7B'],default="7B")
     parser.add_argument("--pred-thresholds", type=float,default=0.5)
+    parser.add_argument("--ee-parallel", action="store_true", help="Enable CUDA-stream overlap for EE head/predictor and speculative next layer")
+    parser.add_argument("--ee-timing-mode", type=str, choices=["sync", "perf"], default="sync", help="EE timing mode: sync (accurate, sync-heavy) or perf (low-overhead)")
+    parser.add_argument("--ee-debug-stats", action="store_true", help="Enable per-gate debug counters (adds overhead; keep off for perf)")
 
     args = parser.parse_args()
     main(args)

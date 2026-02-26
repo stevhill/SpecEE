@@ -72,6 +72,10 @@ class EEModel(nn.Module):
             skip_model = None,
             predictor_path = None,
             pred_thresholds = None,
+            ee_parallel_enabled = False,
+            ee_timing_mode = "sync",
+                ee_parallel_clone_cache = True,
+                ee_debug_stats = False,
             **kwargs,
     ):
         #assert Type=="LLaMA" or "Mixtral"
@@ -82,6 +86,10 @@ class EEModel(nn.Module):
 
         base_model.model.predictors = [torch.load(predictor_path+'/model'+str(layer_idx)+'.pth',weights_only=False).to(torch.float16) for layer_idx in range(len(base_model.model.layers))]
         base_model.model.pred_thresholds = pred_thresholds
+        base_model.model.ee_parallel_enabled = ee_parallel_enabled
+        base_model.model.ee_timing_mode = ee_timing_mode
+        base_model.model.ee_parallel_clone_cache = ee_parallel_clone_cache
+        base_model.model.ee_debug_enabled = ee_debug_stats
         configpath=os.path.join(ea_model_path,"config.json")
         model = cls(
             base_model,
@@ -100,27 +108,61 @@ class EEModel(nn.Module):
             input_ids=None,
             max_new_tokens=10, 
             exit_layer_id_list = None,
+            ee_parallel_enabled = None,
+            ee_timing_mode = None,
+            ee_debug_stats = None,
     ):
-        
+        if ee_parallel_enabled is not None:
+            self.base_model.model.ee_parallel_enabled = ee_parallel_enabled
+        if ee_timing_mode is not None:
+            self.base_model.model.ee_timing_mode = ee_timing_mode
+        if ee_debug_stats is not None:
+            self.base_model.model.ee_debug_enabled = ee_debug_stats
+        timing_sync_mode = getattr(self.base_model.model, "ee_timing_mode", "sync") == "sync"
+        self.base_model.model.ee_timing_enabled = timing_sync_mode
+
         self.ea_layer.reset_kv()  # clear speculative head KV state
         if hasattr(self.base_model, "model") and hasattr(self.base_model.model, "reset_ee_timing"):  # timing hook
             self.base_model.model.reset_ee_timing()  # reset early-exit head timing
-        if torch.cuda.is_available():  # sync before timing on GPU
+        if torch.cuda.is_available() and timing_sync_mode:  # sync before timing only in sync mode
             torch.cuda.synchronize()  # sync before timing on GPU
         total_start = time.perf_counter()  # start total model timer
         draft_time_total = 0.0  # accumulate EAGLE draft-model runtime
         draft_calls = 0  # count EAGLE draft-model invocations
+        ee_debug_totals = {
+            "selected_layers": 0,
+            "pred_pass": 0,
+            "token_match": 0,
+            "early_exit": 0,
+            "prefetch_launch": 0,
+            "prefetch_consume": 0,
+        }
+
+        def _accumulate_ee_debug():
+            ee_debug = getattr(self.base_model.model, "ee_debug", None)
+            if not isinstance(ee_debug, dict):
+                return
+            for key in ee_debug_totals:
+                ee_debug_totals[key] += int(ee_debug.get(key, 0))
+
         with torch.inference_mode():
             input_len = input_ids.shape[1]
             outputs,token = self.base_model.model(
-                input_ids=input_ids, use_cache=True,lm_head = self.base_model.lm_head,exit_layer_id_list=exit_layer_id_list
+                input_ids=input_ids,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=False,
+                lm_head=self.base_model.lm_head,
+                exit_layer_id_list=exit_layer_id_list,
             )
-            hidden_states = outputs[0].clone()
+            _accumulate_ee_debug()
+            hidden_states = outputs[0]
             past_key_values = outputs[1]
-            token = token.to(input_ids.device)
+            if token.device != input_ids.device:
+                token = token.to(input_ids.device)
             input_ids = torch.cat((input_ids, token), dim=1)
             # EAGLE draft model execution: runs ea_layer to propose draft candidates/head for verification.
-            if hidden_states.is_cuda:  # use CUDA events for low-overhead draft timing
+            if hidden_states.is_cuda and timing_sync_mode:  # sync timing path for accurate draft timing
                 draft_start = torch.cuda.Event(enable_timing=True)  # create draft timing start event
                 draft_end = torch.cuda.Event(enable_timing=True)  # create draft timing end event
                 draft_start.record()  # record draft call start
@@ -136,20 +178,25 @@ class EEModel(nn.Module):
             for _ in range(max_new_tokens - 1):
                 outputs,token = self.base_model.model(
                     input_ids=token,
-                    past_key_values = past_key_values,
+                    past_key_values=past_key_values,
                     use_cache=True,
                     init=False,
-                    draft_lm_head_weight = top_head_weight,
-                    draft_token_index = topk_index,
-                    lm_head = self.base_model.lm_head,
-                    exit_layer_id_list = exit_layer_id_list
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    draft_lm_head_weight=top_head_weight,
+                    draft_token_index=topk_index,
+                    lm_head=self.base_model.lm_head,
+                    exit_layer_id_list=exit_layer_id_list,
                 )
-                hidden_states = outputs[0].clone()
+                _accumulate_ee_debug()
+                hidden_states = outputs[0]
                 past_key_values = outputs[1]
-                input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
+                if token.device != input_ids.device:
+                    token = token.to(input_ids.device)
+                input_ids = torch.cat((input_ids, token), dim=1)
                 
                 # EAGLE draft model execution at each decode step (updates draft top-k and draft head weights).
-                if hidden_states.is_cuda:  # use CUDA events for low-overhead draft timing
+                if hidden_states.is_cuda and timing_sync_mode:  # sync timing path for accurate draft timing
                     draft_start = torch.cuda.Event(enable_timing=True)  # create draft timing start event
                     draft_end = torch.cuda.Event(enable_timing=True)  # create draft timing end event
                     draft_start.record()  # record draft call start
@@ -164,7 +211,7 @@ class EEModel(nn.Module):
                 draft_calls += 1  # count per-step draft call
                 if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():  # stop on EOS
                     break  # stop on EOS
-        if torch.cuda.is_available():  # sync after inference on GPU
+        if torch.cuda.is_available() and timing_sync_mode:  # sync after inference only in sync mode
             torch.cuda.synchronize()  # sync after inference on GPU
         total_end = time.perf_counter()  # end total model timer
         ee_timing = getattr(self.base_model.model, "ee_timing", {}) if hasattr(self.base_model, "model") else {}  # pull head timing
@@ -174,6 +221,7 @@ class EEModel(nn.Module):
             "ee_head_calls": ee_timing.get("head_calls", 0),  # head call count
             "draft_time_s": draft_time_total,  # EAGLE draft-model runtime
             "draft_calls": draft_calls,  # EAGLE draft-model call count
+            "ee_debug": ee_debug_totals if self.base_model.model.ee_debug_enabled else {},
         }
         return input_ids  # return generated ids
                 

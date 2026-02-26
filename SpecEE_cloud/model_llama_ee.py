@@ -22,6 +22,7 @@ import math
 import warnings
 from typing import List, Optional, Tuple, Union
 import time
+import copy
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -990,6 +991,18 @@ class LlamaModel(LlamaPreTrainedModel):
         self.pred_thresholds = 0.5
         self.ee_timing = {"head_time_s": 0.0, "head_calls": 0}  # track early-exit head time/calls
         self.ee_timing_enabled = True  # allow toggling head timing
+        self.ee_timing_mode = "sync"  # "sync" uses CUDA event sync, "perf" avoids sync barriers
+        self.ee_parallel_enabled = False  # overlap EE head/predictor with speculative next-layer compute
+        self.ee_parallel_clone_cache = True  # clone cache for speculative branch to preserve exact semantics
+        self.ee_debug_enabled = False  # disable gate-debug counters by default for perf
+        self.ee_debug = {
+            "selected_layers": 0,
+            "pred_pass": 0,
+            "token_match": 0,
+            "early_exit": 0,
+            "prefetch_launch": 0,
+            "prefetch_consume": 0,
+        }
         self.post_init()
 
     def reset_ee_timing(self):  # reset early-exit timing counters
@@ -1008,6 +1021,46 @@ class LlamaModel(LlamaPreTrainedModel):
             elapsed_s = time.perf_counter() - start_time  # compute elapsed wall time
         self.ee_timing["head_time_s"] += elapsed_s  # accumulate head time
         self.ee_timing["head_calls"] += 1  # count head invocation
+
+    def _start_ee_head_timer(self, hidden_states):
+        if not self.ee_timing_enabled:
+            return None
+        if hidden_states.is_cuda and self.ee_timing_mode == "sync":
+            ee_start_event = torch.cuda.Event(enable_timing=True)
+            ee_end_event = torch.cuda.Event(enable_timing=True)
+            ee_start_event.record()
+            return (ee_start_event, ee_end_event)
+        return time.perf_counter()
+
+    def _clone_cache_for_parallel(self, cache_obj):
+        if cache_obj is None:
+            return None
+        if isinstance(cache_obj, DynamicCache):
+            try:
+                cloned_cache = DynamicCache()
+                if hasattr(cache_obj, "key_cache"):
+                    cloned_cache.key_cache = list(cache_obj.key_cache)
+                if hasattr(cache_obj, "value_cache"):
+                    cloned_cache.value_cache = list(cache_obj.value_cache)
+                if hasattr(cache_obj, "seen_tokens"):
+                    cloned_cache.seen_tokens = cache_obj.seen_tokens
+                if hasattr(cache_obj, "_seen_tokens"):
+                    cloned_cache._seen_tokens = cache_obj._seen_tokens
+                return cloned_cache
+            except Exception:
+                pass
+        try:
+            return copy.deepcopy(cache_obj)
+        except Exception:
+            pass
+        if hasattr(cache_obj, "to_legacy_cache"):
+            try:
+                return DynamicCache.from_legacy_cache(cache_obj.to_legacy_cache())
+            except Exception:
+                return None
+        return None
+
+
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1100,6 +1153,7 @@ class LlamaModel(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
+        current_past_key_values = past_key_values
         last_prob = None
         # Heuristic predictor scheduling: fixed offline set + online context-nearby exits.
         dynamic_layers = [15, 16, 17, 19, 21, 24, 26, 28]  # fixed offline predictors
@@ -1111,31 +1165,63 @@ class LlamaModel(LlamaPreTrainedModel):
                         dynamic_layers.append(x + y - 1)
         layer_selected = dynamic_layers
         
+        prefetch_stream = None
+        prefetched_idx = -1
+        prefetched_layer_outputs = None
+        can_parallel_prefetch = (
+            self.ee_parallel_enabled
+            and torch.cuda.is_available()
+            and hidden_states.is_cuda
+            and not (self.gradient_checkpointing and self.training)
+        )
+        if can_parallel_prefetch:
+            prefetch_stream = torch.cuda.Stream(device=hidden_states.device)
+
+        ee_debug = None
+        if self.ee_debug_enabled:
+            ee_debug = {
+                "selected_layers": 0,
+                "pred_pass": 0,
+                "token_match": 0,
+                "early_exit": 0,
+                "prefetch_launch": 0,
+                "prefetch_consume": 0,
+            }
+
         for idx,decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                )
+            if prefetched_idx == idx:
+                torch.cuda.current_stream(hidden_states.device).wait_stream(prefetch_stream)
+                layer_outputs = prefetched_layer_outputs
+                if ee_debug is not None:
+                    ee_debug["prefetch_consume"] += 1
+                prefetched_idx = -1
+                prefetched_layer_outputs = None
             else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                )
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        current_past_key_values,
+                        output_attentions,
+                        use_cache,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=current_past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                    )
             hidden_states = layer_outputs[0]       
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                current_past_key_values = next_decoder_cache
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -1143,14 +1229,40 @@ class LlamaModel(LlamaPreTrainedModel):
             if not init and idx <= len(self.layers):
                 if idx not in layer_selected:
                     continue
+                if ee_debug is not None:
+                    ee_debug["selected_layers"] += 1
                 # Speculative early-exit head: compute draft logits/prob/variation, run per-layer MLP, then verify.
-                ee_start = None  # default timing sentinel
-                if self.ee_timing_enabled and True:  # timing guard
-                    if hidden_states.is_cuda:  # use CUDA events when running on GPU
-                        ee_start_event = torch.cuda.Event(enable_timing=True)  # create start timing event
-                        ee_end_event = torch.cuda.Event(enable_timing=True)  # create end timing event
-                        ee_start_event.record()  # record start event on current stream
-                        ee_start = (ee_start_event, ee_end_event)  # pass event pair to recorder
+                ee_start = self._start_ee_head_timer(hidden_states)
+
+                next_idx = idx + 1
+                next_is_predictor_layer = next_idx in layer_selected
+                if (
+                    can_parallel_prefetch
+                    and next_idx < len(self.layers)
+                    and prefetched_idx == -1
+                    #and not next_is_predictor_layer
+                ):
+                    speculative_cache = next_decoder_cache
+                    can_launch_prefetch = True
+                    if use_cache and self.ee_parallel_clone_cache:
+                        speculative_cache = self._clone_cache_for_parallel(next_decoder_cache)
+                        if next_decoder_cache is not None and speculative_cache is None:
+                            can_launch_prefetch = False
+                    if can_launch_prefetch and not (use_cache and speculative_cache is next_decoder_cache and next_decoder_cache is not None):
+                        current_stream = torch.cuda.current_stream(hidden_states.device)
+                        prefetch_stream.wait_stream(current_stream)
+                        with torch.cuda.stream(prefetch_stream):
+                            prefetched_layer_outputs = self.layers[next_idx](
+                                hidden_states,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                past_key_value=speculative_cache,
+                                output_attentions=output_attentions,
+                                use_cache=use_cache,
+                            )
+                        prefetched_idx = next_idx
+                        if ee_debug is not None:
+                            ee_debug["prefetch_launch"] += 1
                 
                 hidden_states_tmp = self.norm(hidden_states)
                 draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
@@ -1165,29 +1277,32 @@ class LlamaModel(LlamaPreTrainedModel):
                 else:
                     feature = torch.cat([hidden_states_tmp,draft_logits,draft_prob],dim=-1).squeeze(0)
                 
-                if self.ee_timing_enabled and False:  # timing guard
-                    if hidden_states.is_cuda:  # use CUDA events when running on GPU
-                        ee_start_event = torch.cuda.Event(enable_timing=True)  # create start timing event
-                        ee_end_event = torch.cuda.Event(enable_timing=True)  # create end timing event
-                        ee_start_event.record()  # record start event on current stream
-                        ee_start = (ee_start_event, ee_end_event)  # pass event pair to recorder
-                
-                
                 pred = self.predictors[idx](feature)
 
                 #if ee_start is not None:  # timing guard for early exit
                 #    self._record_ee_head_time(ee_start) 
 
                 if pred > self.pred_thresholds:
+                    if ee_debug is not None:
+                        ee_debug["pred_pass"] += 1
                     logits = lm_head(hidden_states_tmp)
                     token = torch.argmax(logits[:, -1])
                     token = token[None, None]
                     # if token == input_ids[-1]:
                     #     continue 
                     if ee_start is not None:  # timing guard for early exit
-                            self._record_ee_head_time(ee_start)  # record head time on early exit
-                    if token in draft_token_index:
+                        self._record_ee_head_time(ee_start)  # record head time on early exit
+                    if torch.eq(draft_token_index, token).any():
+                        if ee_debug is not None:
+                            ee_debug["token_match"] += 1
+                        #if can_parallel_prefetch and prefetch_stream is not None:
+                            #torch.cuda.current_stream(hidden_states.device).wait_stream(prefetch_stream)
+                        prefetched_idx = -1
+                        prefetched_layer_outputs = None
 
+                        if ee_debug is not None:
+                            ee_debug["early_exit"] += 1
+                            self.ee_debug = ee_debug
                         exit_layer_id_list.append(idx+1)
                         hidden_states = hidden_states_tmp
                         if output_hidden_states:
@@ -1206,6 +1321,8 @@ class LlamaModel(LlamaPreTrainedModel):
                 else:
                     if ee_start is not None:  # timing guard for non-exit path
                         self._record_ee_head_time(ee_start)  # record head time on non-exit path
+        if can_parallel_prefetch and prefetch_stream is not None and prefetched_idx != -1:
+            torch.cuda.current_stream(hidden_states.device).wait_stream(prefetch_stream)
         hidden_states = self.norm(hidden_states)
         logits = lm_head(hidden_states)
         token = torch.argmax(logits[:, -1])
@@ -1217,7 +1334,11 @@ class LlamaModel(LlamaPreTrainedModel):
         if use_cache:
             next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
         if not return_dict:
+            if ee_debug is not None:
+                self.ee_debug = ee_debug
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+        if ee_debug is not None:
+            self.ee_debug = ee_debug
         exit_layer_id_list.append(idx+1)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
