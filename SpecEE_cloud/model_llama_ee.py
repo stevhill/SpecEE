@@ -989,11 +989,12 @@ class LlamaModel(LlamaPreTrainedModel):
         self.layers_count = []
         self.predictors = None
         self.pred_thresholds = 0.5
-        self.ee_timing = {"head_time_s": 0.0, "head_calls": 0}  # track early-exit head time/calls
+        self.ee_timing = {"head_time_s": 0.0, "head_calls": 0, "forward_time_s": 0.0, "forward_tokens": 0}  # track early-exit head and per-token forward timing
         self.ee_timing_enabled = True  # allow toggling head timing
         self.ee_timing_mode = "sync"  # "sync" uses CUDA event sync, "perf" avoids sync barriers
         self.ee_parallel_enabled = False  # overlap EE head/predictor with speculative next-layer compute
         self.ee_parallel_clone_cache = True  # clone cache for speculative branch to preserve exact semantics
+        self.ee_parallel_prefetch_stride = 2  # launch speculative prefetch every N predictor checks when parallel mode is on
         self.ee_debug_enabled = False  # disable gate-debug counters by default for perf
         self.ee_debug = {
             "selected_layers": 0,
@@ -1008,6 +1009,8 @@ class LlamaModel(LlamaPreTrainedModel):
     def reset_ee_timing(self):  # reset early-exit timing counters
         self.ee_timing["head_time_s"] = 0.0  # clear accumulated head time
         self.ee_timing["head_calls"] = 0  # clear head call count
+        self.ee_timing["forward_time_s"] = 0.0  # clear accumulated per-token forward time
+        self.ee_timing["forward_tokens"] = 0  # clear per-token forward count
 
     def _record_ee_head_time(self, start_time):  # record per-head duration
         if not self.ee_timing_enabled:  # skip timing when disabled
@@ -1021,6 +1024,19 @@ class LlamaModel(LlamaPreTrainedModel):
             elapsed_s = time.perf_counter() - start_time  # compute elapsed wall time
         self.ee_timing["head_time_s"] += elapsed_s  # accumulate head time
         self.ee_timing["head_calls"] += 1  # count head invocation
+
+    def _record_ee_forward_token_time(self, start_time):  # record per-token forward-pass duration
+        if not self.ee_timing_enabled:  # skip timing when disabled
+            return  # skip timing when disabled
+        if isinstance(start_time, tuple):  # CUDA event timing path
+            start_event, end_event = start_time  # unpack CUDA timing events
+            end_event.record()  # mark end of timed CUDA region
+            end_event.synchronize()  # wait for end event completion
+            elapsed_s = start_event.elapsed_time(end_event) / 1000.0  # convert ms to seconds
+        else:  # CPU fallback timing path
+            elapsed_s = time.perf_counter() - start_time  # compute elapsed wall time
+        self.ee_timing["forward_time_s"] += elapsed_s  # accumulate per-token forward time
+        self.ee_timing["forward_tokens"] += 1  # count one decode-token forward pass
 
     def _start_ee_head_timer(self, hidden_states):
         if not self.ee_timing_enabled:
@@ -1148,6 +1164,9 @@ class LlamaModel(LlamaPreTrainedModel):
                 attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
             )
         hidden_states = inputs_embeds
+        ee_forward_start = None  # default per-token forward timing sentinel
+        if not init:  # time only decode-token forward passes
+            ee_forward_start = self._start_ee_head_timer(hidden_states)  # start per-token forward timer
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1236,11 +1255,14 @@ class LlamaModel(LlamaPreTrainedModel):
 
                 next_idx = idx + 1
                 next_is_predictor_layer = next_idx in layer_selected
+                prefetch_stride = max(1, int(getattr(self, "ee_parallel_prefetch_stride", 1)))
+                should_prefetch_this_layer = (idx % prefetch_stride) == 0
                 if (
                     can_parallel_prefetch
                     and next_idx < len(self.layers)
                     and prefetched_idx == -1
-                    #and not next_is_predictor_layer
+                    and not next_is_predictor_layer
+                    and should_prefetch_this_layer
                 ):
                     speculative_cache = next_decoder_cache
                     can_launch_prefetch = True
@@ -1250,7 +1272,7 @@ class LlamaModel(LlamaPreTrainedModel):
                             can_launch_prefetch = False
                     if can_launch_prefetch and not (use_cache and speculative_cache is next_decoder_cache and next_decoder_cache is not None):
                         current_stream = torch.cuda.current_stream(hidden_states.device)
-                        prefetch_stream.wait_stream(current_stream)
+                        #prefetch_stream.wait_stream(current_stream)
                         with torch.cuda.stream(prefetch_stream):
                             prefetched_layer_outputs = self.layers[next_idx](
                                 hidden_states,
@@ -1290,8 +1312,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     token = token[None, None]
                     # if token == input_ids[-1]:
                     #     continue 
-                    if ee_start is not None:  # timing guard for early exit
-                        self._record_ee_head_time(ee_start)  # record head time on early exit
+
                     if torch.eq(draft_token_index, token).any():
                         if ee_debug is not None:
                             ee_debug["token_match"] += 1
@@ -1311,13 +1332,19 @@ class LlamaModel(LlamaPreTrainedModel):
                         if use_cache:
                             next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
                         if not return_dict:
+                            if ee_forward_start is not None:  # timing guard for tuple return path
+                                self._record_ee_forward_token_time(ee_forward_start)  # record per-token forward time
                             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+                        if ee_forward_start is not None:  # timing guard for dict return path
+                            self._record_ee_forward_token_time(ee_forward_start)  # record per-token forward time
                         return BaseModelOutputWithPast(
                             last_hidden_state=hidden_states,
                             past_key_values=next_cache,
                             hidden_states=all_hidden_states,
                             attentions=all_self_attns,
                         ), token
+                    if ee_start is not None:  # timing guard for early exit
+                        self._record_ee_head_time(ee_start)  # record head time on early exit
                 else:
                     if ee_start is not None:  # timing guard for non-exit path
                         self._record_ee_head_time(ee_start)  # record head time on non-exit path
@@ -1336,10 +1363,14 @@ class LlamaModel(LlamaPreTrainedModel):
         if not return_dict:
             if ee_debug is not None:
                 self.ee_debug = ee_debug
+            if ee_forward_start is not None:  # timing guard for tuple return path
+                self._record_ee_forward_token_time(ee_forward_start)  # record per-token forward time
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         if ee_debug is not None:
             self.ee_debug = ee_debug
         exit_layer_id_list.append(idx+1)
+        if ee_forward_start is not None:  # timing guard for final return path
+            self._record_ee_forward_token_time(ee_forward_start)  # record per-token forward time
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,

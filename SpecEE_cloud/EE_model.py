@@ -219,6 +219,8 @@ class EEModel(nn.Module):
             "total_time_s": total_end - total_start,  # total runtime
             "ee_head_time_s": ee_timing.get("head_time_s", 0.0),  # head runtime
             "ee_head_calls": ee_timing.get("head_calls", 0),  # head call count
+            "ee_forward_time_s": ee_timing.get("forward_time_s", 0.0),  # decode forward runtime
+            "ee_forward_tokens": ee_timing.get("forward_tokens", 0),  # decode forward token count
             "draft_time_s": draft_time_total,  # EAGLE draft-model runtime
             "draft_calls": draft_calls,  # EAGLE draft-model call count
             "ee_debug": ee_debug_totals if self.base_model.model.ee_debug_enabled else {},

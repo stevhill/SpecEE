@@ -62,6 +62,8 @@ def main(args):
         output_ids_tot = 0
         ee_head_time_total = 0.0  # accumulate early-exit head time
         draft_time_total = 0.0  # accumulate EAGLE draft-model time
+        ee_forward_time_total = 0.0  # accumulate decode forward-pass time
+        ee_forward_tokens_total = 0  # count decode forward-pass tokens
         ee_head_calls = 0  # count early-exit head calls
         ee_total_time = 0.0  # accumulate total model time
         ee_debug_totals = {
@@ -72,6 +74,7 @@ def main(args):
             "prefetch_launch": 0,
             "prefetch_consume": 0,
         }
+
         st = time.time()
         torch.cuda.empty_cache()
         for i in trange(len(question_list)):
@@ -97,6 +100,8 @@ def main(args):
                 ee_head_time_total += model.last_timing.get("ee_head_time_s", 0.0)  # sum head time
                 ee_head_calls += model.last_timing.get("ee_head_calls", 0)  # sum head calls
                 draft_time_total += model.last_timing.get("draft_time_s", 0.0)  # sum draft-model time
+                ee_forward_time_total += model.last_timing.get("ee_forward_time_s", 0.0)  # sum decode forward time
+                ee_forward_tokens_total += model.last_timing.get("ee_forward_tokens", 0)  # sum decode forward tokens
                 ee_total_time += model.last_timing.get("total_time_s", 0.0)  # sum total time
                 if args.ee_debug_stats:
                     ee_debug = model.last_timing.get("ee_debug", {})
@@ -110,8 +115,12 @@ def main(args):
         if ee_total_time > 0:  # avoid divide by zero
             ee_percent = (ee_head_time_total / ee_total_time) * 100.0  # compute head share
             draft_percent = (draft_time_total / ee_total_time) * 100.0  # compute draft-model share
+            forward_percent = (ee_forward_time_total / ee_total_time) * 100.0  # compute decode forward share
             print('SpecEE early-exit head time (% of model runtime): ', f"{ee_percent:.2f}%")  # report percent
             print('SpecEE average number of early exit runs per token: ', ee_head_calls/len(exit_layer_id_list))
+            print('SpecEE decode forward-pass time (% of model runtime): ', f"{forward_percent:.2f}%")  # report percent
+            if ee_forward_tokens_total > 0:  # avoid divide by zero
+                print('SpecEE decode forward-pass time per token (ms): ', f"{(ee_forward_time_total / ee_forward_tokens_total) * 1000.0:.3f}")  # report per-token forward timing
             print('SpecEE EAGLE draft model time (% of model runtime): ', f"{draft_percent:.2f}%")  # report percent
             if args.ee_debug_stats:
                 print('SpecEE gate stats: ', ee_debug_totals)
