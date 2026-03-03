@@ -53,7 +53,7 @@ class EEModel(nn.Module):
             self.ea_layer.diff_device = False
             
         self.ea_layer.to(self.base_model.dtype).to(device)  # move speculative head to device
-        self.last_timing = {"total_time_s": 0.0, "ee_head_time_s": 0.0, "ee_head_calls": 0, "draft_time_s": 0.0, "draft_calls": 0}  # expose timing
+        self.last_timing = {"total_time_s": 0.0, "ee_head_time_s": 0.0, "ee_head_calls": 0, "ee_lm_head_time_s": 0.0, "ee_lm_head_calls": 0, "draft_time_s": 0.0, "draft_calls": 0}  # expose timing
         
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
@@ -219,6 +219,8 @@ class EEModel(nn.Module):
             "total_time_s": total_end - total_start,  # total runtime
             "ee_head_time_s": ee_timing.get("head_time_s", 0.0),  # head runtime
             "ee_head_calls": ee_timing.get("head_calls", 0),  # head call count
+            "ee_lm_head_time_s": ee_timing.get("lm_head_time_s", 0.0),  # lm_head runtime
+            "ee_lm_head_calls": ee_timing.get("lm_head_calls", 0),  # lm_head call count
             "ee_forward_time_s": ee_timing.get("forward_time_s", 0.0),  # decode forward runtime
             "ee_forward_tokens": ee_timing.get("forward_tokens", 0),  # decode forward token count
             "draft_time_s": draft_time_total,  # EAGLE draft-model runtime

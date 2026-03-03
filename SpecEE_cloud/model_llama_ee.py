@@ -989,7 +989,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.layers_count = []
         self.predictors = None
         self.pred_thresholds = 0.5
-        self.ee_timing = {"head_time_s": 0.0, "head_calls": 0, "forward_time_s": 0.0, "forward_tokens": 0}  # track early-exit head and per-token forward timing
+        self.ee_timing = {"head_time_s": 0.0, "head_calls": 0, "forward_time_s": 0.0, "forward_tokens": 0, "lm_head_time_s": 0.0, "lm_head_calls": 0}  # track early-exit head, forward, and lm_head timing
         self.ee_timing_enabled = True  # allow toggling head timing
         self.ee_timing_mode = "sync"  # "sync" uses CUDA event sync, "perf" avoids sync barriers
         self.ee_parallel_enabled = False  # overlap EE head/predictor with speculative next-layer compute
@@ -1011,6 +1011,8 @@ class LlamaModel(LlamaPreTrainedModel):
         self.ee_timing["head_calls"] = 0  # clear head call count
         self.ee_timing["forward_time_s"] = 0.0  # clear accumulated per-token forward time
         self.ee_timing["forward_tokens"] = 0  # clear per-token forward count
+        self.ee_timing["lm_head_time_s"] = 0.0  # clear accumulated lm_head runtime
+        self.ee_timing["lm_head_calls"] = 0  # clear lm_head call count
 
     def _record_ee_head_time(self, start_time):  # record per-head duration
         if not self.ee_timing_enabled:  # skip timing when disabled
@@ -1037,6 +1039,19 @@ class LlamaModel(LlamaPreTrainedModel):
             elapsed_s = time.perf_counter() - start_time  # compute elapsed wall time
         self.ee_timing["forward_time_s"] += elapsed_s  # accumulate per-token forward time
         self.ee_timing["forward_tokens"] += 1  # count one decode-token forward pass
+
+    def _record_ee_lm_head_time(self, start_time):  # record lm_head duration
+        if not self.ee_timing_enabled:  # skip timing when disabled
+            return  # skip timing when disabled
+        if isinstance(start_time, tuple):  # CUDA event timing path
+            start_event, end_event = start_time  # unpack CUDA timing events
+            end_event.record()  # mark end of timed CUDA region
+            end_event.synchronize()  # wait for end event completion
+            elapsed_s = start_event.elapsed_time(end_event) / 1000.0  # convert ms to seconds
+        else:  # CPU fallback timing path
+            elapsed_s = time.perf_counter() - start_time  # compute elapsed wall time
+        self.ee_timing["lm_head_time_s"] += elapsed_s  # accumulate lm_head time
+        self.ee_timing["lm_head_calls"] += 1  # count lm_head invocation
 
     def _start_ee_head_timer(self, hidden_states):
         if not self.ee_timing_enabled:
@@ -1307,7 +1322,10 @@ class LlamaModel(LlamaPreTrainedModel):
                 if pred > self.pred_thresholds:
                     if ee_debug is not None:
                         ee_debug["pred_pass"] += 1
+                    lm_head_start = self._start_ee_head_timer(hidden_states_tmp)  # start lm_head timer for verification path
                     logits = lm_head(hidden_states_tmp)
+                    if lm_head_start is not None:  # timing guard for verification lm_head
+                        self._record_ee_lm_head_time(lm_head_start)  # record verification lm_head time
                     token = torch.argmax(logits[:, -1])
                     token = token[None, None]
                     # if token == input_ids[-1]:
@@ -1351,7 +1369,10 @@ class LlamaModel(LlamaPreTrainedModel):
         if can_parallel_prefetch and prefetch_stream is not None and prefetched_idx != -1:
             torch.cuda.current_stream(hidden_states.device).wait_stream(prefetch_stream)
         hidden_states = self.norm(hidden_states)
+        lm_head_start = self._start_ee_head_timer(hidden_states)  # start lm_head timer for final-token path
         logits = lm_head(hidden_states)
+        if lm_head_start is not None:  # timing guard for final lm_head
+            self._record_ee_lm_head_time(lm_head_start)  # record final lm_head time
         token = torch.argmax(logits[:, -1])
         token = token[None, None]
         # add hidden states from the last decoder layer
