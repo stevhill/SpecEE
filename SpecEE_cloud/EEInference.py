@@ -159,6 +159,9 @@ def main(args):
                     total += 1
             accuracy = correct / total
             print(f"SpecEE Model's accuracy on comonsenseqa is: {accuracy:.2%}")
+            if len(exit_layer_id_list) > 0:
+                print("SpecEE average layers run per generated token (accuracy mode): ", sum(exit_layer_id_list) / len(exit_layer_id_list))
+                print("SpecEE generated tokens tracked for layer stats (accuracy mode): ", len(exit_layer_id_list))
             torch.cuda.empty_cache()
             tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
             model = AutoModelForCausalLM.from_pretrained(args.base_model_path,torch_dtype=torch.float16,device_map="auto",attn_implementation="eager",low_cpu_mem_usage=True)  # intelligent CPU/GPU placement
@@ -224,6 +227,9 @@ def main(args):
                     correct += 1
                 total +=1
             print("SpecEE Model's accuracy on sst2 is: ",correct/total)
+            if len(exit_layer_id_list) > 0:
+                print("SpecEE average layers run per generated token (accuracy mode): ", sum(exit_layer_id_list) / len(exit_layer_id_list))
+                print("SpecEE generated tokens tracked for layer stats (accuracy mode): ", len(exit_layer_id_list))
             torch.cuda.empty_cache()
             tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
             model = AutoModelForCausalLM.from_pretrained(args.base_model_path,torch_dtype=torch.float16,device_map="auto",attn_implementation="eager",low_cpu_mem_usage=True)  # intelligent CPU/GPU placement
