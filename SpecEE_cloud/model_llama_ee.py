@@ -760,12 +760,37 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
 
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ee_timing_enabled = False
+        self.ee_timing_mode = "sync"
+        self.ee_last_attn_time_s = 0.0
+        self.ee_last_mlp_time_s = 0.0
+
+    def _start_timer(self, hidden_states):
+        if not self.ee_timing_enabled:
+            return None
+        if hidden_states.is_cuda and self.ee_timing_mode == "sync":
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            return (start_event, end_event)
+        return time.perf_counter()
+
+    def _elapsed_timer(self, start_time):
+        if start_time is None:
+            return 0.0
+        if isinstance(start_time, tuple):
+            start_event, end_event = start_time
+            end_event.record()
+            end_event.synchronize()
+            return start_event.elapsed_time(end_event) / 1000.0
+        return time.perf_counter() - start_time
 
     def forward(
         self,
@@ -795,11 +820,14 @@ class LlamaDecoderLayer(nn.Module):
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
+        self.ee_last_attn_time_s = 0.0
+        self.ee_last_mlp_time_s = 0.0
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
+        attn_start = self._start_timer(hidden_states)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -809,12 +837,15 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
+        self.ee_last_attn_time_s = self._elapsed_timer(attn_start)
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        mlp_start = self._start_timer(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        self.ee_last_mlp_time_s = self._elapsed_timer(mlp_start)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -989,7 +1020,26 @@ class LlamaModel(LlamaPreTrainedModel):
         self.layers_count = []
         self.predictors = None
         self.pred_thresholds = 0.5
-        self.ee_timing = {"head_time_s": 0.0, "head_calls": 0, "forward_time_s": 0.0, "forward_tokens": 0, "lm_head_time_s": 0.0, "lm_head_calls": 0}  # track early-exit head, forward, and lm_head timing
+        self.ee_timing = {
+            "head_time_s": 0.0,
+            "head_calls": 0,
+            "forward_time_s": 0.0,
+            "forward_tokens": 0,
+            "lm_head_time_s": 0.0,
+            "lm_head_calls": 0,
+            "attn_time_s": 0.0,
+            "attn_calls": 0,
+            "mlp_time_s": 0.0,
+            "mlp_calls": 0,
+            "decoder_layer_time_s": 0.0,
+            "decoder_layer_calls": 0,
+            "predictor_time_s": 0.0,
+            "predictor_calls": 0,
+            "per_layer_time_s": [0.0 for _ in range(config.num_hidden_layers)],
+            "per_layer_calls": [0 for _ in range(config.num_hidden_layers)],
+            "per_layer_predictor_time_s": [0.0 for _ in range(config.num_hidden_layers)],
+            "per_layer_predictor_calls": [0 for _ in range(config.num_hidden_layers)],
+        }  # track detailed decode timing
         self.ee_timing_enabled = True  # allow toggling head timing
         self.ee_timing_mode = "sync"  # "sync" uses CUDA event sync, "perf" avoids sync barriers
         self.ee_parallel_enabled = False  # overlap EE head/predictor with speculative next-layer compute
@@ -1013,43 +1063,47 @@ class LlamaModel(LlamaPreTrainedModel):
         self.ee_timing["forward_tokens"] = 0  # clear per-token forward count
         self.ee_timing["lm_head_time_s"] = 0.0  # clear accumulated lm_head runtime
         self.ee_timing["lm_head_calls"] = 0  # clear lm_head call count
+        self.ee_timing["attn_time_s"] = 0.0  # clear attention runtime
+        self.ee_timing["attn_calls"] = 0  # clear attention call count
+        self.ee_timing["mlp_time_s"] = 0.0  # clear mlp runtime
+        self.ee_timing["mlp_calls"] = 0  # clear mlp call count
+        self.ee_timing["decoder_layer_time_s"] = 0.0  # clear decoder-layer runtime
+        self.ee_timing["decoder_layer_calls"] = 0  # clear decoder-layer call count
+        self.ee_timing["predictor_time_s"] = 0.0  # clear predictor runtime
+        self.ee_timing["predictor_calls"] = 0  # clear predictor call count
+        self.ee_timing["per_layer_time_s"] = [0.0 for _ in range(len(self.layers))]  # clear per-layer runtime
+        self.ee_timing["per_layer_calls"] = [0 for _ in range(len(self.layers))]  # clear per-layer call count
+        self.ee_timing["per_layer_predictor_time_s"] = [0.0 for _ in range(len(self.layers))]  # clear per-layer predictor runtime
+        self.ee_timing["per_layer_predictor_calls"] = [0 for _ in range(len(self.layers))]  # clear per-layer predictor calls
 
-    def _record_ee_head_time(self, start_time):  # record per-head duration
-        if not self.ee_timing_enabled:  # skip timing when disabled
-            return  # skip timing when disabled
+    def _elapsed_ee_timer(self, start_time):  # compute elapsed time for perf-counter or CUDA events
+        if start_time is None:
+            return 0.0
         if isinstance(start_time, tuple):  # CUDA event timing path
             start_event, end_event = start_time  # unpack CUDA timing events
             end_event.record()  # mark end of timed CUDA region
             end_event.synchronize()  # wait for end event completion
-            elapsed_s = start_event.elapsed_time(end_event) / 1000.0  # convert ms to seconds
-        else:  # CPU fallback timing path
-            elapsed_s = time.perf_counter() - start_time  # compute elapsed wall time
+            return start_event.elapsed_time(end_event) / 1000.0  # convert ms to seconds
+        return time.perf_counter() - start_time  # compute elapsed wall time
+
+    def _record_ee_head_time(self, start_time):  # record per-head duration
+        if not self.ee_timing_enabled:  # skip timing when disabled
+            return  # skip timing when disabled
+        elapsed_s = self._elapsed_ee_timer(start_time)
         self.ee_timing["head_time_s"] += elapsed_s  # accumulate head time
         self.ee_timing["head_calls"] += 1  # count head invocation
 
     def _record_ee_forward_token_time(self, start_time):  # record per-token forward-pass duration
         if not self.ee_timing_enabled:  # skip timing when disabled
             return  # skip timing when disabled
-        if isinstance(start_time, tuple):  # CUDA event timing path
-            start_event, end_event = start_time  # unpack CUDA timing events
-            end_event.record()  # mark end of timed CUDA region
-            end_event.synchronize()  # wait for end event completion
-            elapsed_s = start_event.elapsed_time(end_event) / 1000.0  # convert ms to seconds
-        else:  # CPU fallback timing path
-            elapsed_s = time.perf_counter() - start_time  # compute elapsed wall time
+        elapsed_s = self._elapsed_ee_timer(start_time)
         self.ee_timing["forward_time_s"] += elapsed_s  # accumulate per-token forward time
         self.ee_timing["forward_tokens"] += 1  # count one decode-token forward pass
 
     def _record_ee_lm_head_time(self, start_time):  # record lm_head duration
         if not self.ee_timing_enabled:  # skip timing when disabled
             return  # skip timing when disabled
-        if isinstance(start_time, tuple):  # CUDA event timing path
-            start_event, end_event = start_time  # unpack CUDA timing events
-            end_event.record()  # mark end of timed CUDA region
-            end_event.synchronize()  # wait for end event completion
-            elapsed_s = start_event.elapsed_time(end_event) / 1000.0  # convert ms to seconds
-        else:  # CPU fallback timing path
-            elapsed_s = time.perf_counter() - start_time  # compute elapsed wall time
+        elapsed_s = self._elapsed_ee_timer(start_time)
         self.ee_timing["lm_head_time_s"] += elapsed_s  # accumulate lm_head time
         self.ee_timing["lm_head_calls"] += 1  # count lm_head invocation
 
@@ -1223,6 +1277,8 @@ class LlamaModel(LlamaPreTrainedModel):
             }
 
         for idx,decoder_layer in enumerate(self.layers):
+            decoder_layer.ee_timing_enabled = self.ee_timing_enabled
+            decoder_layer.ee_timing_mode = self.ee_timing_mode
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             if prefetched_idx == idx:
@@ -1233,6 +1289,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 prefetched_idx = -1
                 prefetched_layer_outputs = None
             else:
+                layer_start = self._start_ee_head_timer(hidden_states)
                 if self.gradient_checkpointing and self.training:
                     layer_outputs = self._gradient_checkpointing_func(
                         decoder_layer.__call__,
@@ -1252,6 +1309,17 @@ class LlamaModel(LlamaPreTrainedModel):
                         output_attentions=output_attentions,
                         use_cache=use_cache,
                     )
+                if not init and layer_start is not None:
+                    layer_elapsed_s = self._elapsed_ee_timer(layer_start)
+                    self.ee_timing["decoder_layer_time_s"] += layer_elapsed_s
+                    self.ee_timing["decoder_layer_calls"] += 1
+                    if idx < len(self.ee_timing["per_layer_time_s"]):
+                        self.ee_timing["per_layer_time_s"][idx] += layer_elapsed_s
+                        self.ee_timing["per_layer_calls"][idx] += 1
+                    self.ee_timing["attn_time_s"] += float(getattr(decoder_layer, "ee_last_attn_time_s", 0.0))
+                    self.ee_timing["attn_calls"] += 1
+                    self.ee_timing["mlp_time_s"] += float(getattr(decoder_layer, "ee_last_mlp_time_s", 0.0))
+                    self.ee_timing["mlp_calls"] += 1
             hidden_states = layer_outputs[0]       
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -1300,7 +1368,6 @@ class LlamaModel(LlamaPreTrainedModel):
                         prefetched_idx = next_idx
                         if ee_debug is not None:
                             ee_debug["prefetch_launch"] += 1
-                
                 hidden_states_tmp = self.norm(hidden_states)
                 draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
                 draft_prob = F.softmax(draft_logits, dim=-1)
@@ -1314,7 +1381,16 @@ class LlamaModel(LlamaPreTrainedModel):
                 else:
                     feature = torch.cat([hidden_states_tmp,draft_logits,draft_prob],dim=-1).squeeze(0)
                 
+                pred_start = self._start_ee_head_timer(hidden_states_tmp)
                 pred = self.predictors[idx](feature)
+                if pred_start is not None:
+                    pred_elapsed_s = self._elapsed_ee_timer(pred_start)
+                    self.ee_timing["predictor_time_s"] += pred_elapsed_s
+                    self.ee_timing["predictor_calls"] += 1
+                    if idx < len(self.ee_timing["per_layer_predictor_time_s"]):
+                        self.ee_timing["per_layer_predictor_time_s"][idx] += pred_elapsed_s
+                        self.ee_timing["per_layer_predictor_calls"][idx] += 1
+
 
                 #if ee_start is not None:  # timing guard for early exit
                 #    self._record_ee_head_time(ee_start) 
