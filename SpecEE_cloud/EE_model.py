@@ -53,7 +53,7 @@ class EEModel(nn.Module):
             self.ea_layer.diff_device = False
             
         self.ea_layer.to(self.base_model.dtype).to(device)  # move speculative head to device
-        self.last_timing = {"total_time_s": 0.0, "ee_head_time_s": 0.0, "ee_head_calls": 0, "ee_lm_head_time_s": 0.0, "ee_lm_head_calls": 0, "draft_time_s": 0.0, "draft_calls": 0}  # expose timing
+        self.last_timing = {"total_time_s": 0.0, "ee_head_time_s": 0.0, "ee_head_calls": 0, "ee_lm_head_time_s": 0.0, "ee_lm_head_calls": 0, "ee_attn_time_s": 0.0, "ee_attn_calls": 0, "ee_mlp_time_s": 0.0, "ee_mlp_calls": 0, "ee_decoder_layer_time_s": 0.0, "ee_decoder_layer_calls": 0, "ee_predictor_time_s": 0.0, "ee_predictor_calls": 0, "ee_per_layer_time_s": [], "ee_per_layer_calls": [], "ee_per_layer_predictor_time_s": [], "ee_per_layer_predictor_calls": [], "draft_time_s": 0.0, "draft_calls": 0}  # expose timing
         
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
@@ -221,6 +221,18 @@ class EEModel(nn.Module):
             "ee_head_calls": ee_timing.get("head_calls", 0),  # head call count
             "ee_lm_head_time_s": ee_timing.get("lm_head_time_s", 0.0),  # lm_head runtime
             "ee_lm_head_calls": ee_timing.get("lm_head_calls", 0),  # lm_head call count
+            "ee_attn_time_s": ee_timing.get("attn_time_s", 0.0),  # decoder self-attention runtime
+            "ee_attn_calls": ee_timing.get("attn_calls", 0),  # decoder self-attention call count
+            "ee_mlp_time_s": ee_timing.get("mlp_time_s", 0.0),  # decoder MLP runtime
+            "ee_mlp_calls": ee_timing.get("mlp_calls", 0),  # decoder MLP call count
+            "ee_decoder_layer_time_s": ee_timing.get("decoder_layer_time_s", 0.0),  # decoder layer total runtime
+            "ee_decoder_layer_calls": ee_timing.get("decoder_layer_calls", 0),  # decoder layer call count
+            "ee_predictor_time_s": ee_timing.get("predictor_time_s", 0.0),  # predictor runtime
+            "ee_predictor_calls": ee_timing.get("predictor_calls", 0),  # predictor call count
+            "ee_per_layer_time_s": ee_timing.get("per_layer_time_s", []),  # per-layer runtime totals
+            "ee_per_layer_calls": ee_timing.get("per_layer_calls", []),  # per-layer call totals
+            "ee_per_layer_predictor_time_s": ee_timing.get("per_layer_predictor_time_s", []),  # per-layer predictor runtime totals
+            "ee_per_layer_predictor_calls": ee_timing.get("per_layer_predictor_calls", []),  # per-layer predictor call totals
             "ee_forward_time_s": ee_timing.get("forward_time_s", 0.0),  # decode forward runtime
             "ee_forward_tokens": ee_timing.get("forward_tokens", 0),  # decode forward token count
             "draft_time_s": draft_time_total,  # EAGLE draft-model runtime

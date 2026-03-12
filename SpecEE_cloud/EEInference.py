@@ -62,11 +62,23 @@ def main(args):
         output_ids_tot = 0
         ee_head_time_total = 0.0  # accumulate early-exit head time
         ee_lm_head_time_total = 0.0  # accumulate lm_head time
+        ee_attn_time_total = 0.0  # accumulate decoder self-attention time
+        ee_mlp_time_total = 0.0  # accumulate decoder MLP time
+        ee_decoder_layer_time_total = 0.0  # accumulate total decoder-layer time
+        ee_predictor_time_total = 0.0  # accumulate predictor runtime
         draft_time_total = 0.0  # accumulate EAGLE draft-model time
         ee_forward_time_total = 0.0  # accumulate decode forward-pass time
         ee_forward_tokens_total = 0  # count decode forward-pass tokens
         ee_head_calls = 0  # count early-exit head calls
         ee_lm_head_calls = 0  # count lm_head calls
+        ee_attn_calls = 0  # count self-attention calls
+        ee_mlp_calls = 0  # count MLP calls
+        ee_decoder_layer_calls = 0  # count decoder-layer calls
+        ee_predictor_calls = 0  # count predictor calls
+        ee_per_layer_time_totals = []  # aggregate per-layer runtime across prompts
+        ee_per_layer_call_totals = []  # aggregate per-layer calls across prompts
+        ee_per_layer_predictor_time_totals = []  # aggregate per-layer predictor runtime across prompts
+        ee_per_layer_predictor_call_totals = []  # aggregate per-layer predictor calls across prompts
         ee_total_time = 0.0  # accumulate total model time
         ee_debug_totals = {
             "selected_layers": 0,
@@ -103,33 +115,126 @@ def main(args):
                 ee_head_calls += model.last_timing.get("ee_head_calls", 0)  # sum head calls
                 ee_lm_head_time_total += model.last_timing.get("ee_lm_head_time_s", 0.0)  # sum lm_head time
                 ee_lm_head_calls += model.last_timing.get("ee_lm_head_calls", 0)  # sum lm_head calls
+                ee_attn_time_total += model.last_timing.get("ee_attn_time_s", 0.0)  # sum attention time
+                ee_attn_calls += model.last_timing.get("ee_attn_calls", 0)  # sum attention calls
+                ee_mlp_time_total += model.last_timing.get("ee_mlp_time_s", 0.0)  # sum mlp time
+                ee_mlp_calls += model.last_timing.get("ee_mlp_calls", 0)  # sum mlp calls
+                ee_decoder_layer_time_total += model.last_timing.get("ee_decoder_layer_time_s", 0.0)  # sum decoder-layer time
+                ee_decoder_layer_calls += model.last_timing.get("ee_decoder_layer_calls", 0)  # sum decoder-layer calls
+                ee_predictor_time_total += model.last_timing.get("ee_predictor_time_s", 0.0)  # sum predictor time
+                ee_predictor_calls += model.last_timing.get("ee_predictor_calls", 0)  # sum predictor calls
                 draft_time_total += model.last_timing.get("draft_time_s", 0.0)  # sum draft-model time
                 ee_forward_time_total += model.last_timing.get("ee_forward_time_s", 0.0)  # sum decode forward time
                 ee_forward_tokens_total += model.last_timing.get("ee_forward_tokens", 0)  # sum decode forward tokens
                 ee_total_time += model.last_timing.get("total_time_s", 0.0)  # sum total time
+                per_layer_times = model.last_timing.get("ee_per_layer_time_s", [])  # per-layer runtime for this prompt
+                per_layer_calls = model.last_timing.get("ee_per_layer_calls", [])  # per-layer call counts for this prompt
+                per_layer_pred_times = model.last_timing.get("ee_per_layer_predictor_time_s", [])  # per-layer predictor runtime for this prompt
+                per_layer_pred_calls = model.last_timing.get("ee_per_layer_predictor_calls", [])  # per-layer predictor call counts for this prompt
+                if per_layer_times and (not ee_per_layer_time_totals):
+                    ee_per_layer_time_totals = [0.0 for _ in range(len(per_layer_times))]
+                    ee_per_layer_call_totals = [0 for _ in range(len(per_layer_calls))]
+                if per_layer_pred_times and (not ee_per_layer_predictor_time_totals):
+                    ee_per_layer_predictor_time_totals = [0.0 for _ in range(len(per_layer_pred_times))]
+                    ee_per_layer_predictor_call_totals = [0 for _ in range(len(per_layer_pred_calls))]
+                if per_layer_times and len(per_layer_times) == len(ee_per_layer_time_totals):
+                    for layer_idx, layer_time_s in enumerate(per_layer_times):
+                        ee_per_layer_time_totals[layer_idx] += float(layer_time_s)
+                if per_layer_calls and len(per_layer_calls) == len(ee_per_layer_call_totals):
+                    for layer_idx, layer_calls in enumerate(per_layer_calls):
+                        ee_per_layer_call_totals[layer_idx] += int(layer_calls)
+                if per_layer_pred_times and len(per_layer_pred_times) == len(ee_per_layer_predictor_time_totals):
+                    for layer_idx, layer_time_s in enumerate(per_layer_pred_times):
+                        ee_per_layer_predictor_time_totals[layer_idx] += float(layer_time_s)
+                if per_layer_pred_calls and len(per_layer_pred_calls) == len(ee_per_layer_predictor_call_totals):
+                    for layer_idx, layer_calls in enumerate(per_layer_pred_calls):
+                        ee_per_layer_predictor_call_totals[layer_idx] += int(layer_calls)
                 if args.ee_debug_stats:
                     ee_debug = model.last_timing.get("ee_debug", {})
                     for key in ee_debug_totals:
                         ee_debug_totals[key] += int(ee_debug.get(key, 0))
             output_ids_tot += len(output_ids[0]) - seqlen
             output=model.tokenizer.decode(output_ids[0])
+            if i >=10:
+                break
         ed = time.time()
         spec = output_ids_tot/(ed-st)
         print('SpecEE '+ args.dataset + ' tokens per second :  ',spec)
         if ee_total_time > 0:  # avoid divide by zero
             ee_percent = (ee_head_time_total / ee_total_time) * 100.0  # compute head share
             lm_head_percent = (ee_lm_head_time_total / ee_total_time) * 100.0  # compute lm_head share
+            attn_percent = (ee_attn_time_total / ee_total_time) * 100.0  # compute attention share
+            mlp_percent = (ee_mlp_time_total / ee_total_time) * 100.0  # compute mlp share
+            decoder_layer_percent = (ee_decoder_layer_time_total / ee_total_time) * 100.0  # compute decoder-layer share
+            predictor_percent = (ee_predictor_time_total / ee_total_time) * 100.0  # compute predictor share
             draft_percent = (draft_time_total / ee_total_time) * 100.0  # compute draft-model share
             forward_percent = (ee_forward_time_total / ee_total_time) * 100.0  # compute decode forward share
+            residual_time_s = max(0.0, ee_total_time - (ee_head_time_total + ee_lm_head_time_total + ee_attn_time_total + ee_mlp_time_total + ee_predictor_time_total + draft_time_total + ee_forward_time_total))  # untracked/overhead bucket
+            residual_percent = (residual_time_s / ee_total_time) * 100.0  # compute overhead share
             print('SpecEE early-exit head time (% of model runtime): ', f"{ee_percent:.2f}%")  # report percent
-            print('SpecEE average number of early exit runs per token: ', ee_head_calls/len(exit_layer_id_list))
+            if len(exit_layer_id_list) > 0:
+                print('SpecEE average number of early exit runs per token: ', ee_head_calls/len(exit_layer_id_list))
+            else:
+                print('SpecEE average number of early exit runs per token:  n/a (no early exits)')
             print('SpecEE lm_head time (% of model runtime): ', f"{lm_head_percent:.2f}%")  # report percent
             if ee_lm_head_calls > 0:  # avoid divide by zero
                 print('SpecEE lm_head time per call (ms): ', f"{(ee_lm_head_time_total / ee_lm_head_calls) * 1000.0:.3f}")  # report per-call lm_head timing
+            print('SpecEE decoder self-attention time (% of model runtime): ', f"{attn_percent:.2f}%")  # report percent
+            if ee_attn_calls > 0:  # avoid divide by zero
+                print('SpecEE decoder self-attention time per call (ms): ', f"{(ee_attn_time_total / ee_attn_calls) * 1000.0:.3f}")  # report per-call attention timing
+            print('SpecEE decoder MLP time (% of model runtime): ', f"{mlp_percent:.2f}%")  # report percent
+            if ee_mlp_calls > 0:  # avoid divide by zero
+                print('SpecEE decoder MLP time per call (ms): ', f"{(ee_mlp_time_total / ee_mlp_calls) * 1000.0:.3f}")  # report per-call MLP timing
+            print('SpecEE decoder-layer total time (% of model runtime): ', f"{decoder_layer_percent:.2f}%")  # report percent
+            if ee_decoder_layer_calls > 0:  # avoid divide by zero
+                print('SpecEE decoder-layer time per call (ms): ', f"{(ee_decoder_layer_time_total / ee_decoder_layer_calls) * 1000.0:.3f}")  # report per-call decoder-layer timing
+            print('SpecEE predictor time (% of model runtime): ', f"{predictor_percent:.2f}%")  # report percent
+            if ee_predictor_calls > 0:  # avoid divide by zero
+                print('SpecEE predictor time per run (ms): ', f"{(ee_predictor_time_total / ee_predictor_calls) * 1000.0:.3f}")  # report per-run predictor timing
             print('SpecEE decode forward-pass time (% of model runtime): ', f"{forward_percent:.2f}%")  # report percent
             if ee_forward_tokens_total > 0:  # avoid divide by zero
                 print('SpecEE decode forward-pass time per token (ms): ', f"{(ee_forward_time_total / ee_forward_tokens_total) * 1000.0:.3f}")  # report per-token forward timing
             print('SpecEE EAGLE draft model time (% of model runtime): ', f"{draft_percent:.2f}%")  # report percent
+            print('SpecEE residual/untracked time (% of model runtime): ', f"{residual_percent:.2f}%")  # report overhead share
+            component_percents = {
+                'decode forward-pass': forward_percent,
+                'decoder self-attention': attn_percent,
+                'decoder MLP': mlp_percent,
+                'decoder-layer total': decoder_layer_percent,
+                'predictor': predictor_percent,
+                'early-exit head': ee_percent,
+                'EAGLE draft model': draft_percent,
+                'lm_head': lm_head_percent,
+                'residual/untracked': residual_percent,
+            }
+            bottleneck_name, bottleneck_percent = max(component_percents.items(), key=lambda item: item[1])
+            print(f"SpecEE bottleneck component: {bottleneck_name} ({bottleneck_percent:.2f}% of model runtime)")
+            if ee_per_layer_time_totals:
+                layer_summaries = []
+                for layer_idx, layer_time_s in enumerate(ee_per_layer_time_totals):
+                    if layer_time_s <= 0:
+                        continue
+                    layer_pct = (layer_time_s / ee_total_time) * 100.0
+                    calls = ee_per_layer_call_totals[layer_idx] if layer_idx < len(ee_per_layer_call_totals) else 0
+                    avg_ms = (layer_time_s / calls) * 1000.0 if calls > 0 else 0.0
+                    layer_summaries.append((layer_idx, layer_pct, avg_ms))
+                layer_summaries.sort(key=lambda x: x[1], reverse=True)
+                print('SpecEE top decoder layers by runtime share:')
+                for layer_idx, layer_pct, avg_ms in layer_summaries[:5]:
+                    print(f'  layer {layer_idx}: {layer_pct:.2f}% total, {avg_ms:.3f} ms/call')
+            if ee_per_layer_predictor_time_totals:
+                predictor_layer_summaries = []
+                for layer_idx, layer_time_s in enumerate(ee_per_layer_predictor_time_totals):
+                    if layer_time_s <= 0:
+                        continue
+                    layer_pct = (layer_time_s / ee_total_time) * 100.0
+                    calls = ee_per_layer_predictor_call_totals[layer_idx] if layer_idx < len(ee_per_layer_predictor_call_totals) else 0
+                    avg_ms = (layer_time_s / calls) * 1000.0 if calls > 0 else 0.0
+                    predictor_layer_summaries.append((layer_idx, layer_pct, avg_ms))
+                predictor_layer_summaries.sort(key=lambda x: x[1], reverse=True)
+                print('SpecEE top predictor layers by runtime share:')
+                for layer_idx, layer_pct, avg_ms in predictor_layer_summaries[:5]:
+                    print(f'  predictor layer {layer_idx}: {layer_pct:.2f}% total, {avg_ms:.3f} ms/run')
             if args.ee_debug_stats:
                 print('SpecEE gate stats: ', ee_debug_totals)
         print('average layer :  ',sum(exit_layer_id_list)/len(exit_layer_id_list))     
