@@ -70,6 +70,15 @@ if is_torch_fx_available():
     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
 
 
+#NPU stuf
+from IRON.iron.operators import (
+    AIEAXPY,
+    AIESoftmax,
+    AIERMSNorm
+)
+from IRON.iron.common.aie_base import AIEOperatorBase
+
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
@@ -1015,6 +1024,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
 
         self.gradient_checkpointing = False
         self.layers_count = []
@@ -1046,6 +1056,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.ee_parallel_clone_cache = True  # clone cache for speculative branch to preserve exact semantics
         self.ee_parallel_prefetch_stride = 2  # launch speculative prefetch every N predictor checks when parallel mode is on
         self.ee_debug_enabled = False  # disable gate-debug counters by default for perf
+        self.npu_enabled = True  # whether the model is running on NPU (used to disable parallel EE which is not currently supported on NPU)
         self.ee_debug = {
             "selected_layers": 0,
             "pred_pass": 0,
@@ -1055,6 +1066,16 @@ class LlamaModel(LlamaPreTrainedModel):
             "prefetch_consume": 0,
         }
         self.post_init()
+
+
+        if self.npu_enabled:
+            self.aie_norm = AIERMSNorm(
+                size = config.hidden_size,
+                eps = config.rms_norm_eps,
+                num_aie_columns=1,
+                num_channels = 2,
+                tile_size = 2048
+            )
 
     def reset_ee_timing(self):  # reset early-exit timing counters
         self.ee_timing["head_time_s"] = 0.0  # clear accumulated head time
@@ -1368,9 +1389,16 @@ class LlamaModel(LlamaPreTrainedModel):
                         prefetched_idx = next_idx
                         if ee_debug is not None:
                             ee_debug["prefetch_launch"] += 1
-                hidden_states_tmp = self.norm(hidden_states)
-                draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
-                draft_prob = F.softmax(draft_logits, dim=-1)
+
+
+                if self.npu_enabled:
+                    hidden_states_tmp = self.aie_norm.forward(hidden_states)
+                    draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
+                    draft_prob = F.softmax(draft_logits, dim=-1)
+                else:
+                    hidden_states_tmp = self.norm(hidden_states)
+                    draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
+                    draft_prob = F.softmax(draft_logits, dim=-1)
                 if last_prob is None:
                     prob_gap = draft_prob
                 else:
@@ -1497,7 +1525,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     def get_output_embeddings(self):
         return self.lm_head
 
-    def set_output_embeddings(self, new_embeddings):
+    def set_output_embeddings(self, newaie_embeddings):
         self.lm_head = new_embeddings
 
     def set_decoder(self, decoder):

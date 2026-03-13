@@ -11,6 +11,7 @@ from model_llama_ee import MLP
 from transformers import AutoTokenizer
 from configs import EConfig
 from cnets import Model
+from IRON.iron.common.aie_base import AIEOperatorBase
 
 
 
@@ -100,6 +101,12 @@ class EEModel(nn.Module):
         ea_layer_state_dict = torch.load(load_model_path,
                                          map_location=base_model.device)
         model.ea_layer.load_state_dict(ea_layer_state_dict, strict=True)
+
+        # Initialize AIE operators if NPU is enabled
+        if hasattr(base_model.model, 'npu_enabled') and base_model.model.npu_enabled:
+            context = AIEOperatorBase.get_default_context()
+            context.compile_all()
+            context.prepare_runtime()
 
         return model
     
