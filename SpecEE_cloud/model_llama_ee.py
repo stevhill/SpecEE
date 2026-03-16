@@ -72,12 +72,14 @@ if is_torch_fx_available():
 
 #NPU stuf
 from IRON.iron.operators import (
-    AIEAXPY,
+    AIEGEMV,
     AIESoftmax,
-    AIERMSNorm
+    AIERMSNorm,
+    AIELayerNorm,
 )
 from IRON.iron.common.aie_base import AIEOperatorBase
-
+from IRON.iron.common.aie_device_manager import pyxrt
+from ml_dtypes import bfloat16
 
 logger = logging.get_logger(__name__)
 
@@ -1074,8 +1076,71 @@ class LlamaModel(LlamaPreTrainedModel):
                 eps = config.rms_norm_eps,
                 num_aie_columns=1,
                 num_channels = 2,
-                tile_size = 2048
+                tile_size = config.hidden_size,
+                weighted = True
             )
+            # Copy weights from regular norm to AIE norm
+            self.aie_norm.weight = torch.nn.Parameter(self.norm.weight.data.clone())
+            self.aie_linear = AIEGEMV(
+                M = 4,
+                K = config.hidden_size,
+                tile_size_input=1,
+                tile_size_output=4,
+                num_aie_columns=1,
+                is_mv=True,
+            )
+
+    def _ensure_aie_runtime_ready(self):
+        if not self.npu_enabled:
+            return
+        context = AIEOperatorBase.get_default_context()
+        if not getattr(context, "_runtime_prepared", False):
+            context.compile_all()
+            context.prepare_runtime()
+
+    def _ensure_aie_linear_runtime_ready(self):
+        if not self.npu_enabled:
+            return
+
+        self._ensure_aie_runtime_ready()
+        if "matrix" in getattr(self.aie_linear, "buffer_bos", {}):
+            return
+
+        op = self.aie_linear
+        context = op.context
+
+        if op.xclbin_artifact is None or op.insts_artifact is None:
+            op.compile()
+
+        if len(op.kernels) == 0 or len(op.buffers) == 0:
+            op.set_up_runtime()
+
+        for kernel_name, (xclbin, xclbin_kernel_name, insts) in op.kernels.items():
+            if kernel_name in op.xrt_kernels:
+                continue
+            handle = context.device_manager.get_kernel_handle(
+                str(xclbin.path), xclbin_kernel_name, str(insts.path)
+            )
+            op.xrt_kernels[kernel_name] = (
+                handle.context,
+                handle.kernel,
+                handle.insts_bo,
+                len(handle.insts),
+            )
+
+        for buffer_name, buffer_size in op.buffers.items():
+            if buffer_name in op.buffer_bos:
+                continue
+            op.buffer_bos[buffer_name] = pyxrt.bo(
+                context.device_manager.device,
+                buffer_size,
+                pyxrt.bo.host_only,
+                0x10000,
+            )
+
+        op.xrt_runlist = None
+
+
 
     def reset_ee_timing(self):  # reset early-exit timing counters
         self.ee_timing["head_time_s"] = 0.0  # clear accumulated head time
@@ -1390,15 +1455,32 @@ class LlamaModel(LlamaPreTrainedModel):
                         if ee_debug is not None:
                             ee_debug["prefetch_launch"] += 1
 
-
+                #npu stuff
                 if self.npu_enabled:
-                    hidden_states_tmp = self.aie_norm.forward(hidden_states)
-                    draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
+                    self._ensure_aie_linear_runtime_ready()
+                    hidden_states_cpu = hidden_states.cpu().to(dtype=torch.bfloat16)
+                    draft_lm_head_weight_cpu = draft_lm_head_weight.cpu().to(dtype=torch.bfloat16)
+                    # Copy weights from regular norm to AIE norm
+                    self.aie_norm.weight = self.norm.weight.to(torch.bfloat16)
+                    hidden_states_tmp_cpu = self.aie_norm.forward(hidden_states_cpu)
+                    #draft_lm_head_weight_cpu = draft_lm_head_weight_cpu.reshape(-1, draft_lm_head_weight_cpu.shape[-1])
+                    if draft_lm_head_weight_cpu.shape[0] != self.aie_linear.M:
+                        raise RuntimeError(
+                            f"AIE linear expects {self.aie_linear.M} draft rows, got {draft_lm_head_weight_cpu.shape[0]}"
+                        )
+                    draft_logits = self.aie_linear.forward(hidden_states_tmp_cpu, draft_lm_head_weight_cpu)
+
+
+                    hidden_states_tmp = hidden_states_tmp_cpu.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                    draft_logits = draft_logits.to(device=hidden_states.device, dtype=hidden_states.dtype)
                     draft_prob = F.softmax(draft_logits, dim=-1)
                 else:
                     hidden_states_tmp = self.norm(hidden_states)
                     draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
                     draft_prob = F.softmax(draft_logits, dim=-1)
+
+
+
                 if last_prob is None:
                     prob_gap = draft_prob
                 else:

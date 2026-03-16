@@ -33,6 +33,7 @@ class AIERMSNorm(AIEOperatorBase):
         weighted=False,
         context=None,
     ):
+        print(f"DEBUG: AIERMSNorm.__init__ starting, context={context}")
         max_multiple = num_aie_columns * tile_size
         padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
         self.orig_size = size
@@ -56,7 +57,9 @@ class AIERMSNorm(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
+        print(f"DEBUG: AIERMSNorm calling parent __init__")
         AIEOperatorBase.__init__(self, context=context)
+        print(f"DEBUG: AIERMSNorm.__init__ complete")
 
     def set_up_artifacts(self):
         # Compilation artifacts
@@ -175,6 +178,9 @@ class AIERMSNorm(AIEOperatorBase):
         # x, y are [batch, size]
         batch = x.shape[0] if x.dim() > 1 else 1
 
+        # Preserve original dtype for output
+        original_dtype = x.dtype
+
         # Flatten inputs for AIE processing
         x_flat = x.view(-1)
         if y is not None:
@@ -198,4 +204,6 @@ class AIERMSNorm(AIEOperatorBase):
         self.run_runlist()
         result = self.read_buffer_as_torch("output", shape=x_flat.shape, dtype=bfloat16)
 
+        # Restore original input dtype
+        result = result.to(dtype=original_dtype)
         return result

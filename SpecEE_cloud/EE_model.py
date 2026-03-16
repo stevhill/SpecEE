@@ -104,6 +104,9 @@ class EEModel(nn.Module):
 
         # Initialize AIE operators if NPU is enabled
         if hasattr(base_model.model, 'npu_enabled') and base_model.model.npu_enabled:
+            # Copy weights from regular norm to AIE norm after model is loaded
+            #TODO: clean this up
+            base_model.model.aie_norm.weight = torch.nn.Parameter(base_model.model.norm.weight.data.clone()).to(torch.bfloat16)
             context = AIEOperatorBase.get_default_context()
             context.compile_all()
             context.prepare_runtime()

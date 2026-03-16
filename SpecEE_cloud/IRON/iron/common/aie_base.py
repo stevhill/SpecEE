@@ -25,7 +25,8 @@ class AIEOperatorBase(ABC):
         """One global 'default' context if none is specified"""
         # Always check the AIEOperatorBase class directly using __dict__
         if "_default_context" not in AIEOperatorBase.__dict__:
-            AIEOperatorBase._default_context = AIEContext()
+            # Disable runlist for environments without full AIE hardware support
+            AIEOperatorBase._default_context = AIEContext(use_runlist=False)
         return AIEOperatorBase._default_context
 
     def __init__(self, context=None):

@@ -14,7 +14,7 @@ import aie.utils.config
 class AIEContext:
     """Context for managing AIE operator compilation and runtime state"""
 
-    def __init__(self, use_runlist=True, mlir_verbose=None):
+    def __init__(self, use_runlist=False, mlir_verbose=None):
         self.operators = []
         self.static_data_pool = {}
         self.device_manager = AIEDeviceManager()

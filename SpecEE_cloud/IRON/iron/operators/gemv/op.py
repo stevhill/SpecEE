@@ -176,6 +176,22 @@ class AIEGEMV(AIEOperatorBase):
             and vector.dtype == torch.bfloat16
         )
         if not applicable:
+            if (matrix_rows != self.M):
+                print(
+                    f"Matrix rows {matrix_rows} do not match expected {self.M} for this operator."
+                )
+            if (matrix_cols != self.K):
+                print(
+                    f"Matrix cols {matrix_cols} do not match expected {self.K} for this operator."
+                )
+            if (vector_size != self.K):
+                print(
+                    f"Vector size {vector_size} does not match expected {self.K} for this operator."
+                )
+            if (matrix is not None and matrix.dtype != torch.bfloat16):
+                print(
+                    f"Matrix dtype {matrix.dtype} is not bfloat16 as expected by this operator."
+                )
             raise AIEOperatorConstraintError(
                 "AIEElementwiseAdd: incompatible tensor shape(s)"
             )

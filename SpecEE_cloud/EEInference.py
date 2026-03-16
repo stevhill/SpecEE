@@ -155,7 +155,7 @@ def main(args):
                         ee_debug_totals[key] += int(ee_debug.get(key, 0))
             output_ids_tot += len(output_ids[0]) - seqlen
             output=model.tokenizer.decode(output_ids[0])
-            if i >=10:
+            if i >=2:
                 break
         ed = time.time()
         spec = output_ids_tot/(ed-st)
@@ -237,6 +237,7 @@ def main(args):
                     print(f'  predictor layer {layer_idx}: {layer_pct:.2f}% total, {avg_ms:.3f} ms/run')
             if args.ee_debug_stats:
                 print('SpecEE gate stats: ', ee_debug_totals)
+
         print('average layer :  ',sum(exit_layer_id_list)/len(exit_layer_id_list))     
         del model  # free SpecEE model memory before loading HF baseline
         gc.collect()  # force cleanup of Python references to release VRAM sooner
