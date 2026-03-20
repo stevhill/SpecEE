@@ -12,6 +12,7 @@ from .layer_norm.op import AIELayerNorm
 from .leaky_relu.op import AIELeakyReLU
 from .mem_copy.op import AIEMemCopy
 from .mha.op import AIEMHA
+from .predictor_mlp.op import AIEPredictorMLP
 from .relu.op import AIEReLU
 from .rms_norm.op import AIERMSNorm
 from .rope.op import AIERope
