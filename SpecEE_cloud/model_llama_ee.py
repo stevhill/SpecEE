@@ -19,6 +19,7 @@
 # limitations under the License.
 """ PyTorch LLaMA model."""
 import math
+import os
 import warnings
 from typing import List, Optional, Tuple, Union
 import time
@@ -73,6 +74,8 @@ if is_torch_fx_available():
 #NPU stuf
 from IRON.iron.operators import (
     AIEGEMV,
+    AIEReLU,
+    AIESigmoid,
     AIESoftmax,
     AIERMSNorm,
     AIELayerNorm,
@@ -983,15 +986,12 @@ LLAMA_INPUTS_DOCSTRING = r"""
 """
 
 
-@add_start_docstrings(
-    "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
-    LLAMA_START_DOCSTRING,
-)
 
 
-class MLP(nn.Module):
+"""
+class MLPold(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
-        super(MLP, self).__init__()
+        super(MLPold, self).__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(hidden_size, output_size)
@@ -1004,6 +1004,33 @@ class MLP(nn.Module):
         out = self.fc2(out)
         out = self.sigmoid(out)
         return out
+"""
+
+@add_start_docstrings(
+    "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
+    LLAMA_START_DOCSTRING,
+)
+
+
+
+class MLP(nn.Module):
+    """Simple 4-layer MLP with fc1->relu->fc2->sigmoid"""
+    def __init__(self, input_size, hidden_size, output_size):
+        super(MLP, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size, bias=False)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_size, output_size, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        """PyTorch-based forward pass using all 4 layers"""
+        out = self.fc1(x)
+        out = self.relu(out)
+        out = self.fc2(out)
+        out = self.sigmoid(out)
+        return out
+
+    
     
     
 class LlamaModel(LlamaPreTrainedModel):
@@ -1013,6 +1040,12 @@ class LlamaModel(LlamaPreTrainedModel):
     Args:
         config: LlamaConfig
     """
+
+    # Class-level shared AIE MLP operators (created once, used by all instances)
+    mlp_ai_fc1 = None
+    mlp_ai_relu = None
+    mlp_ai_sigmoid = None
+    mlp_ai_fc2 = None
 
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
@@ -1058,7 +1091,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.ee_parallel_clone_cache = True  # clone cache for speculative branch to preserve exact semantics
         self.ee_parallel_prefetch_stride = 2  # launch speculative prefetch every N predictor checks when parallel mode is on
         self.ee_debug_enabled = False  # disable gate-debug counters by default for perf
-        self.npu_enabled = True  # whether the model is running on NPU (used to disable parallel EE which is not currently supported on NPU)
+        self.npu_enabled = True # whether the model is running on NPU (used to disable parallel EE which is not currently supported on NPU)
         self.ee_debug = {
             "selected_layers": 0,
             "pred_pass": 0,
@@ -1085,11 +1118,22 @@ class LlamaModel(LlamaPreTrainedModel):
                 M = 4,
                 K = config.hidden_size,
                 tile_size_input=1,
-                tile_size_output=4,
+                tile_size_output=2,
                 num_aie_columns=1,
                 is_mv=True,
             )
+            self.aie_head_size = self.vocab_size
+            self.aie_lmhead = AIEGEMV(
+                M = config.vocab_size,
+                K = config.hidden_size,
+                tile_size_input=1,
+                tile_size_output=config.vocab_size // 16,
+                num_aie_columns=8,
+            )
 
+
+
+    """    
     def _ensure_aie_runtime_ready(self):
         if not self.npu_enabled:
             return
@@ -1139,7 +1183,7 @@ class LlamaModel(LlamaPreTrainedModel):
             )
 
         op.xrt_runlist = None
-
+    """
 
 
     def reset_ee_timing(self):  # reset early-exit timing counters
@@ -1232,6 +1276,7 @@ class LlamaModel(LlamaPreTrainedModel):
         return None
 
 
+    
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1281,7 +1326,7 @@ class LlamaModel(LlamaPreTrainedModel):
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                    "`use_cache=True` is incompatible with gradient checkMatrix cols 12 do not match expected 1024 for this operator.pointing. Setting `use_cache=False`..."
                 )
                 use_cache = False
 
@@ -1361,7 +1406,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 "prefetch_launch": 0,
                 "prefetch_consume": 0,
             }
-
+        lm_head_weights_cpu = lm_head.weight.cpu().to(dtype=torch.bfloat16) if self.npu_enabled and lm_head is not None else None
         for idx,decoder_layer in enumerate(self.layers):
             decoder_layer.ee_timing_enabled = self.ee_timing_enabled
             decoder_layer.ee_timing_mode = self.ee_timing_mode
@@ -1428,10 +1473,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 should_prefetch_this_layer = (idx % prefetch_stride) == 0
                 if (
                     can_parallel_prefetch
-                    and next_idx < len(self.layers)
-                    and prefetched_idx == -1
-                    and not next_is_predictor_layer
-                    and should_prefetch_this_layer
+
                 ):
                     speculative_cache = next_decoder_cache
                     can_launch_prefetch = True
@@ -1457,7 +1499,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
                 #npu stuff
                 if self.npu_enabled:
-                    self._ensure_aie_linear_runtime_ready()
+                    #self._ensure_aie_linear_runtime_ready()
                     hidden_states_cpu = hidden_states.cpu().to(dtype=torch.bfloat16)
                     draft_lm_head_weight_cpu = draft_lm_head_weight.cpu().to(dtype=torch.bfloat16)
                     # Copy weights from regular norm to AIE norm
@@ -1469,11 +1511,9 @@ class LlamaModel(LlamaPreTrainedModel):
                             f"AIE linear expects {self.aie_linear.M} draft rows, got {draft_lm_head_weight_cpu.shape[0]}"
                         )
                     draft_logits = self.aie_linear.forward(hidden_states_tmp_cpu, draft_lm_head_weight_cpu)
-
-
-                    hidden_states_tmp = hidden_states_tmp_cpu.to(device=hidden_states.device, dtype=hidden_states.dtype)
-                    draft_logits = draft_logits.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                    
                     draft_prob = F.softmax(draft_logits, dim=-1)
+
                 else:
                     hidden_states_tmp = self.norm(hidden_states)
                     draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
@@ -1486,13 +1526,21 @@ class LlamaModel(LlamaPreTrainedModel):
                 else:
                     prob_gap = draft_prob - last_prob
                 last_prob = draft_prob
+
+
                 if len(self.layers) == 32:
+                    
                     feature = torch.cat([draft_logits,draft_prob,prob_gap],dim=-1).squeeze(0)
                 else:
                     feature = torch.cat([hidden_states_tmp,draft_logits,draft_prob],dim=-1).squeeze(0)
                 
-                pred_start = self._start_ee_head_timer(hidden_states_tmp)
+                pred_start = self._start_ee_head_timer(feature)
+                
+
+                # Execute predictor with NPU acceleration if available
+                feature = feature.to(device=hidden_states.device, dtype=hidden_states.dtype) if self.npu_enabled else feature
                 pred = self.predictors[idx](feature)
+                print(self.predictors[idx].fc1.weight.shape, self.predictors[idx].fc2.weight.shape)
                 if pred_start is not None:
                     pred_elapsed_s = self._elapsed_ee_timer(pred_start)
                     self.ee_timing["predictor_time_s"] += pred_elapsed_s
@@ -1508,7 +1556,11 @@ class LlamaModel(LlamaPreTrainedModel):
                 if pred > self.pred_thresholds:
                     if ee_debug is not None:
                         ee_debug["pred_pass"] += 1
+                    if self.npu_enabled:
+                        hidden_states_tmp = hidden_states_tmp_cpu.to(device=hidden_states.device, dtype=hidden_states.dtype)
                     lm_head_start = self._start_ee_head_timer(hidden_states_tmp)  # start lm_head timer for verification path
+                    
+                    #logits_cpu = self.aie_lmhead.forward(hidden_states_tmp_cpu, lm_head_weights_cpu)
                     logits = lm_head(hidden_states_tmp)
                     if lm_head_start is not None:  # timing guard for verification lm_head
                         self._record_ee_lm_head_time(lm_head_start)  # record verification lm_head time

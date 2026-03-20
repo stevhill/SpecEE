@@ -35,7 +35,7 @@ class AIEPredictorMLP(AIEOperatorBase):
 
         Args:
             input_size: Dimension of input feature vector
-            hidden_size: Dimension of hidden layer (will be padded to 1024)
+            hidden_size: Dimension of hidden layer (will be padded to 512)
             output_size: Dimension of output (prediction score, default 1)
             num_aie_columns: Number of AIE columns to use
             context: AIE context for device management
@@ -45,8 +45,8 @@ class AIEPredictorMLP(AIEOperatorBase):
         self.output_size = output_size
         self.num_aie_columns = num_aie_columns
 
-        # AIE works best with size 1024, so we pad hidden dimension
-        self.hidden_size_padded = 1024
+        # AIE works best with size 512, so we pad hidden dimension
+        self.hidden_size_padded = 512
 
         # Weight matrices will be set later or padded version stored
         self.fc1_weight = None  # [hidden_size, input_size]
@@ -73,7 +73,7 @@ class AIEPredictorMLP(AIEOperatorBase):
         self.fc1_weight = fc1_weight.cpu().to(dtype=torch.bfloat16)
         self.fc2_weight = fc2_weight.cpu().to(dtype=torch.bfloat16)
 
-        # Pad FC1 weight: [hidden_size, input_size] -> [1024, input_size]
+        # Pad FC1 weight: [hidden_size, input_size] -> [512, input_size]
         if self.fc1_weight.shape[0] < self.hidden_size_padded:
             fc1_pad = torch.zeros(
                 (self.hidden_size_padded - self.fc1_weight.shape[0], self.input_size),
@@ -84,7 +84,7 @@ class AIEPredictorMLP(AIEOperatorBase):
         else:
             self.fc1_weight_padded = self.fc1_weight
 
-        # Pad FC2 weight: [output_size, hidden_size] -> [output_size, 1024]
+        # Pad FC2 weight: [output_size, hidden_size] -> [output_size, 512]
         if self.fc2_weight.shape[1] < self.hidden_size_padded:
             fc2_pad = torch.zeros(
                 (self.output_size, self.hidden_size_padded - self.fc2_weight.shape[1]),

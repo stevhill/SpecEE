@@ -106,9 +106,9 @@ def test_predictor_mlp_dimensions(aie_context):
     )
 
     # Verify weights are padded correctly
-    assert operator.fc1_weight_padded.shape == (1024, 12), \
+    assert operator.fc1_weight_padded.shape == (512, 12), \
         f"FC1 weight shape mismatch: {operator.fc1_weight_padded.shape}"
-    assert operator.fc2_weight_padded.shape == (1, 1024), \
+    assert operator.fc2_weight_padded.shape == (1, 512), \
         f"FC2 weight shape mismatch: {operator.fc2_weight_padded.shape}"
 
 
@@ -135,8 +135,8 @@ def test_predictor_mlp_forward_shape(aie_context):
     # Verify operator is properly initialized after set_weights
     assert operator._setup_done, "Operator should be setup after set_weights()"
     assert operator.context is not None, "Context should be set"
-    assert operator.fc1_weight_padded.shape == (1024, 12), "FC1 padded weights should have correct shape"
-    assert operator.fc2_weight_padded.shape == (1, 1024), "FC2 padded weights should have correct shape"
+    assert operator.fc1_weight_padded.shape == (512, 12), "FC1 padded weights should have correct shape"
+    assert operator.fc2_weight_padded.shape == (1, 512), "FC2 padded weights should have correct shape"
 
 
 def test_predictor_mlp_no_weights_error(aie_context):

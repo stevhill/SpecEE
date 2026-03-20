@@ -77,6 +77,7 @@ class EEModel(nn.Module):
             ee_timing_mode = "sync",
                 ee_parallel_clone_cache = True,
                 ee_debug_stats = False,
+            npu_enabled = False,
             **kwargs,
     ):
         #assert Type=="LLaMA" or "Mixtral"
@@ -84,8 +85,20 @@ class EEModel(nn.Module):
         base_model = LlamaForCausalLMEE.from_pretrained(
                 base_model_path, **kwargs
             )
+        # Set NPU based on parameter or environment variable
+        # Environment variable takes precedence
+        if os.environ.get('DISABLE_NPU', '0') == '1':
+            base_model.model.npu_enabled = False
+        elif os.environ.get('ENABLE_NPU', '0') == '1':
+            base_model.model.npu_enabled = True
+        else:
+            # Use command line argument if no environment variables set
+            base_model.model.npu_enabled = npu_enabled
 
         base_model.model.predictors = [torch.load(predictor_path+'/model'+str(layer_idx)+'.pth',weights_only=False).to(torch.float16) for layer_idx in range(len(base_model.model.layers))]
+        for idx, predictor in enumerate(base_model.model.predictors):
+            if hasattr(predictor, "rebind_shared_aie_ops"):
+                base_model.model.predictors[idx] = predictor.rebind_shared_aie_ops()
         base_model.model.pred_thresholds = pred_thresholds
         base_model.model.ee_parallel_enabled = ee_parallel_enabled
         base_model.model.ee_timing_mode = ee_timing_mode
@@ -107,9 +120,17 @@ class EEModel(nn.Module):
             # Copy weights from regular norm to AIE norm after model is loaded
             #TODO: clean this up
             base_model.model.aie_norm.weight = torch.nn.Parameter(base_model.model.norm.weight.data.clone()).to(torch.bfloat16)
+
+            # Ensure predictor AIE operators are instantiated before global compile.
+            # This makes predictor MLP kernels compile in the same pass as the base AIE kernels.
+
+
             context = AIEOperatorBase.get_default_context()
             context.compile_all()
             context.prepare_runtime()
+            ctx = AIEOperatorBase.get_default_context()
+            m = model.base_model.model
+
 
         return model
     

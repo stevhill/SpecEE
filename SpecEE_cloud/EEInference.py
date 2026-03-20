@@ -50,6 +50,7 @@ def main(args):
         ee_timing_mode=args.ee_timing_mode,
         ee_parallel_clone_cache=False,
         ee_debug_stats=args.ee_debug_stats,
+        npu_enabled=args.npu_enabled,
         # is_offload = False,
         # skip_model = "/home/xujiaming/xujiaming/research/ASPLOS-24/skip_layer/model.txt",
     )
@@ -437,6 +438,7 @@ if __name__ == "__main__":
     parser.add_argument("--ee-parallel", action="store_true", help="Enable CUDA-stream overlap for EE head/predictor and speculative next layer")
     parser.add_argument("--ee-timing-mode", type=str, choices=["sync", "perf"], default="sync", help="EE timing mode: sync (accurate, sync-heavy) or perf (low-overhead)")
     parser.add_argument("--ee-debug-stats", action="store_true", help="Enable per-gate debug counters (adds overhead; keep off for perf)")
+    parser.add_argument("--npu-enabled", action="store_true", default=False, help="Enable NPU acceleration for AIE operators (predictors and MLP layers)")
 
     args = parser.parse_args()
     main(args)
