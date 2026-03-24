@@ -74,11 +74,9 @@ if is_torch_fx_available():
 #NPU stuf
 from IRON.iron.operators import (
     AIEGEMV,
-    AIEReLU,
-    AIESigmoid,
-    AIESoftmax,
+
     AIERMSNorm,
-    AIELayerNorm,
+    AIEPredictorMLP,
 )
 from IRON.iron.common.aie_base import AIEOperatorBase
 from IRON.iron.common.aie_device_manager import pyxrt
@@ -1064,6 +1062,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.gradient_checkpointing = False
         self.layers_count = []
         self.predictors = None
+        self.aie_predictors = None
         self.pred_thresholds = 0.5
         self.ee_timing = {
             "head_time_s": 0.0,
@@ -1133,6 +1132,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
 
 
+
     """    
     def _ensure_aie_runtime_ready(self):
         if not self.npu_enabled:
@@ -1162,7 +1162,42 @@ class LlamaModel(LlamaPreTrainedModel):
         for kernel_name, (xclbin, xclbin_kernel_name, insts) in op.kernels.items():
             if kernel_name in op.xrt_kernels:
                 continue
-            handle = context.device_manager.get_kernel_handle(
+            handle = context.device_manager.get_kernel_handle(Traceback (most recent call last):
+  File "/home/steven/thesis/parrallel/SpecEE/SpecEE_cloud/EEInference.py", line 444, in <module>
+    main(args)
+  File "/home/steven/thesis/parrallel/SpecEE/SpecEE_cloud/EEInference.py", line 106, in main
+    output_ids=model(
+               ^^^^^^
+  File "/home/steven/anaconda3/envs/iron/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/steven/anaconda3/envs/iron/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/steven/thesis/parrallel/SpecEE/SpecEE_cloud/EE_model.py", line 231, in forward
+    outputs,token = self.base_model.model(
+                    ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/steven/anaconda3/envs/iron/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/steven/anaconda3/envs/iron/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/steven/thesis/parrallel/SpecEE/SpecEE_cloud/model_llama_ee.py", line 1542, in forward
+    pred = self.predictors[idx](feature)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/steven/thesis/parrallel/SpecEE/SpecEE_cloud/IRON/iron/common/aie_base.py", line 55, in __call__
+    return self.forward(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/steven/thesis/parrallel/SpecEE/SpecEE_cloud/IRON/iron/operators/predictor_mlp/op.py", line 198, in forward
+    self.write_buffer("input", x_bf16)
+  File "/home/steven/thesis/parrallel/SpecEE/SpecEE_cloud/IRON/iron/common/aie_base.py", line 122, in write_buffer
+    bo = self.get_bo(buffer_name)
+         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/steven/thesis/parrallel/SpecEE/SpecEE_cloud/IRON/iron/common/aie_base.py", line 92, in get_bo
+    return self.buffer_bos[buffer_name]
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+KeyError: 'input'
                 str(xclbin.path), xclbin_kernel_name, str(insts.path)
             )
             op.xrt_kernels[kernel_name] = (
@@ -1514,6 +1549,23 @@ class LlamaModel(LlamaPreTrainedModel):
                     
                     draft_prob = F.softmax(draft_logits, dim=-1)
 
+                    
+                    if last_prob is None:
+                        prob_gap = draft_prob
+                    else:
+                        prob_gap = draft_prob - last_prob
+                    last_prob = draft_prob
+
+                    if len(self.layers) == 32:
+                        
+                        feature = torch.cat([draft_logits,draft_prob,prob_gap],dim=-1).squeeze(0)
+                    else:
+                        feature = torch.cat([hidden_states_tmp,draft_logits,draft_prob],dim=-1).squeeze(0)
+                    
+                    pred_start = self._start_ee_head_timer(feature)
+
+                    pred = self.aie_predictors[idx].forward(feature)
+
                 else:
                     hidden_states_tmp = self.norm(hidden_states)
                     draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
@@ -1521,26 +1573,28 @@ class LlamaModel(LlamaPreTrainedModel):
 
 
 
-                if last_prob is None:
-                    prob_gap = draft_prob
-                else:
-                    prob_gap = draft_prob - last_prob
-                last_prob = draft_prob
+                    if last_prob is None:
+                        prob_gap = draft_prob
+                    else:
+                        prob_gap = draft_prob - last_prob
+                    last_prob = draft_prob
 
 
-                if len(self.layers) == 32:
+                    if len(self.layers) == 32:
+                        
+                        feature = torch.cat([draft_logits,draft_prob,prob_gap],dim=-1).squeeze(0)
+                    else:
+                        feature = torch.cat([hidden_states_tmp,draft_logits,draft_prob],dim=-1).squeeze(0)
                     
-                    feature = torch.cat([draft_logits,draft_prob,prob_gap],dim=-1).squeeze(0)
-                else:
-                    feature = torch.cat([hidden_states_tmp,draft_logits,draft_prob],dim=-1).squeeze(0)
-                
-                pred_start = self._start_ee_head_timer(feature)
-                
+                    pred_start = self._start_ee_head_timer(feature)
+                    
 
-                # Execute predictor with NPU acceleration if available
-                feature = feature.to(device=hidden_states.device, dtype=hidden_states.dtype) if self.npu_enabled else feature
-                pred = self.predictors[idx](feature)
-                print(self.predictors[idx].fc1.weight.shape, self.predictors[idx].fc2.weight.shape)
+                    # Execute predictor with NPU acceleration if available
+                    feature = feature.to(device=hidden_states.device, dtype=hidden_states.dtype) if self.npu_enabled else feature
+                    pred = self.predictors[idx](feature)
+                # AIEPredictorMLP returns [output_size=2]; take index 0 (padded second row is unused)
+                if hasattr(pred, '__len__') and len(pred) > 1:
+                    pred = pred[0]
                 if pred_start is not None:
                     pred_elapsed_s = self._elapsed_ee_timer(pred_start)
                     self.ee_timing["predictor_time_s"] += pred_elapsed_s

@@ -3,10 +3,11 @@
 
 import torch
 import numpy as np
+import hashlib
 from ml_dtypes import bfloat16
 from pathlib import Path
 
-from iron.common import (
+from IRON.iron.common import (
     AIEOperatorBase,
     AIEOperatorConstraintError,
     XclbinArtifact,
@@ -16,7 +17,7 @@ from iron.common import (
     SourceArtifact,
     PythonGeneratedMLIRArtifact,
 )
-from iron.common.utils import torch_to_numpy
+from IRON.iron.common.utils import torch_to_numpy
 
 
 class AIEPredictorMLP(AIEOperatorBase):
@@ -26,8 +27,9 @@ class AIEPredictorMLP(AIEOperatorBase):
         self,
         input_size=12,
         hidden_size=512,
-        output_size=1,
+        output_size=2,
         num_aie_columns=1,
+        layer_idx=None,
         context=None,
     ):
         """
@@ -44,6 +46,7 @@ class AIEPredictorMLP(AIEOperatorBase):
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.num_aie_columns = num_aie_columns
+        self.layer_idx = layer_idx
 
         # AIE works best with size 512, so we pad hidden dimension
         self.hidden_size_padded = 512
@@ -84,17 +87,33 @@ class AIEPredictorMLP(AIEOperatorBase):
         else:
             self.fc1_weight_padded = self.fc1_weight
 
-        # Pad FC2 weight: [output_size, hidden_size] -> [output_size, 512]
-        if self.fc2_weight.shape[1] < self.hidden_size_padded:
-            fc2_pad = torch.zeros(
-                (self.output_size, self.hidden_size_padded - self.fc2_weight.shape[1]),
+        # Pad FC2 weight to configured output/hidden sizes:
+        # [actual_output_size, actual_hidden_size] -> [output_size, 512]
+        fc2 = self.fc2_weight
+
+        # Align row count (output dimension)
+        if fc2.shape[0] < self.output_size:
+            row_pad = torch.zeros(
+                (self.output_size - fc2.shape[0], fc2.shape[1]),
                 dtype=torch.bfloat16,
                 device="cpu",
             )
-            self.fc2_weight_padded = torch.cat([self.fc2_weight, fc2_pad], dim=1)
-        else:
-            self.fc2_weight_padded = self.fc2_weight
+            fc2 = torch.cat([fc2, row_pad], dim=0)
+        elif fc2.shape[0] > self.output_size:
+            fc2 = fc2[: self.output_size, :]
 
+        # Align column count (hidden dimension)
+        if fc2.shape[1] < self.hidden_size_padded:
+            col_pad = torch.zeros(
+                (self.output_size, self.hidden_size_padded - fc2.shape[1]),
+                dtype=torch.bfloat16,
+                device="cpu",
+            )
+            fc2 = torch.cat([fc2, col_pad], dim=1)
+        elif fc2.shape[1] > self.hidden_size_padded:
+            fc2 = fc2[:, : self.hidden_size_padded]
+
+        self.fc2_weight_padded = fc2
         # Complete the AIE setup if not already done
         if not self._setup_done:
             # Initialize parent class now that weights are available
@@ -110,12 +129,25 @@ class AIEPredictorMLP(AIEOperatorBase):
             )
 
         operator_dir = Path(__file__).parent
-        file_name_base = f"predictor_mlp_{self.input_size}in_{self.hidden_size}h_{self.output_size}out_{self.num_aie_columns}col"
+        layer_suffix = f"_layer{self.layer_idx}" if self.layer_idx is not None else ""
 
         # Convert weights to numpy for design callback
         fc1_weight_np = torch_to_numpy(self.fc1_weight_padded)
         fc2_weight_np = torch_to_numpy(self.fc2_weight_padded)
 
+        # Include a deterministic weight fingerprint in the artifact name.
+        # PythonGeneratedMLIRArtifact availability only tracks source timestamps,
+        # not callback arguments. Since weights are embedded into MLIR constants,
+        # this avoids stale MLIR reuse when model weights change.
+        weight_hash = hashlib.sha1()
+        weight_hash.update(fc1_weight_np.view(np.uint16).tobytes())
+        weight_hash.update(fc2_weight_np.view(np.uint16).tobytes())
+        weight_suffix = weight_hash.hexdigest()[:8]
+
+        file_name_base = (
+            f"predictor_mlp_{self.input_size}in_{self.hidden_size}h_{self.output_size}out_"
+            f"{self.num_aie_columns}col{layer_suffix}_{weight_suffix}"
+        )
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
             import_path=operator_dir / "design.py",
@@ -140,10 +172,10 @@ class AIEPredictorMLP(AIEOperatorBase):
                     f"predictor_mlp_kernels.a",
                     depends=[
                         KernelObjectArtifact.new(
-                            f"mv.o",
+                            f"mlp_predictor.o",
                             depends=[
                                 SourceArtifact.new(
-                                    self.context.base_dir / "aie_kernels" / "generic" / "mv.cc"
+                                    self.context.base_dir / "aie_kernels" / "aie2" / "mlp_predictor.cc"
                                 )
                             ],
                         ),

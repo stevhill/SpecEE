@@ -11,7 +11,11 @@ from model_llama_ee import MLP
 from transformers import AutoTokenizer
 from configs import EConfig
 from cnets import Model
+from IRON.iron.operators import (
+    AIEPredictorMLP
+)
 from IRON.iron.common.aie_base import AIEOperatorBase
+from IRON.iron.common.aie_device_manager import pyxrt
 
 
 
@@ -96,9 +100,18 @@ class EEModel(nn.Module):
             base_model.model.npu_enabled = npu_enabled
 
         base_model.model.predictors = [torch.load(predictor_path+'/model'+str(layer_idx)+'.pth',weights_only=False).to(torch.float16) for layer_idx in range(len(base_model.model.layers))]
+        aie_predictors = []
         for idx, predictor in enumerate(base_model.model.predictors):
-            if hasattr(predictor, "rebind_shared_aie_ops"):
-                base_model.model.predictors[idx] = predictor.rebind_shared_aie_ops()
+
+            aie_predictors.append(AIEPredictorMLP(
+                input_size=predictor.fc1.in_features,
+                hidden_size=predictor.fc1.out_features,
+                output_size=2,
+                num_aie_columns=1,
+                layer_idx=idx,
+            ))
+            aie_predictors[-1].set_weights(predictor.fc1.weight.data, predictor.fc2.weight.data)
+        base_model.model.aie_predictors = aie_predictors  # store AIE Predictor MLPs
         base_model.model.pred_thresholds = pred_thresholds
         base_model.model.ee_parallel_enabled = ee_parallel_enabled
         base_model.model.ee_timing_mode = ee_timing_mode
@@ -274,6 +287,3 @@ class EEModel(nn.Module):
                 
                 
                 
-            
-            
-            

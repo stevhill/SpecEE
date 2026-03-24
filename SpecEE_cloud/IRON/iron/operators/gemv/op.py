@@ -6,7 +6,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 from pathlib import Path
 
-from iron.common import (
+from IRON.iron.common import (
     AIEOperatorBase,
     AIEOperatorConstraintError,
     XclbinArtifact,
@@ -16,7 +16,7 @@ from iron.common import (
     SourceArtifact,
     PythonGeneratedMLIRArtifact,
 )
-from iron.common.utils import torch_to_numpy
+from IRON.iron.common.utils import torch_to_numpy
 
 
 class AIEGEMV(AIEOperatorBase):

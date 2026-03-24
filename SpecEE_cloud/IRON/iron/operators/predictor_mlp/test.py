@@ -75,7 +75,7 @@ def test_predictor_mlp(
         output_buffers={"output": golden_ref["output"]},
         rel_tol=0.04,  # 4% relative tolerance for bfloat16
     )
-
+    print(golden_ref["output"])
     # Assert no errors
     assert not errors, f"Test failed with errors: {errors}"
 

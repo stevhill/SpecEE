@@ -406,7 +406,9 @@ class AieccCompilationRule(CompilationRule):
                     )
                 else:
                     raise RuntimeError(
-                        f"MLIR compilation for {mlir_source.path} failed: {result.stderr}"
+                        f"MLIR compilation for {mlir_source.path} failed:\n"
+                        f"--- stderr ---\n{result.stderr}\n"
+                        f"--- stdout ---\n{result.stdout}"
                     )
 
                 # There may be multiple targets that require an xclbin/insts.bin from the same MLIR with different names; copy them
