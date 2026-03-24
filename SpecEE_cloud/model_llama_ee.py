@@ -19,9 +19,11 @@
 # limitations under the License.
 """ PyTorch LLaMA model."""
 import math
+import os
 import warnings
 from typing import List, Optional, Tuple, Union
 import time
+import copy
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -68,6 +70,19 @@ if is_torch_fx_available():
 
     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
 
+
+#NPU stuf
+from IRON.iron.operators import (
+    AIEGEMV,
+    AIEReLU,
+    AIESigmoid,
+    AIESoftmax,
+    AIERMSNorm,
+    AIELayerNorm,
+)
+from IRON.iron.common.aie_base import AIEOperatorBase
+from IRON.iron.common.aie_device_manager import pyxrt
+from ml_dtypes import bfloat16
 
 logger = logging.get_logger(__name__)
 
@@ -759,12 +774,37 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
 
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ee_timing_enabled = False
+        self.ee_timing_mode = "sync"
+        self.ee_last_attn_time_s = 0.0
+        self.ee_last_mlp_time_s = 0.0
+
+    def _start_timer(self, hidden_states):
+        if not self.ee_timing_enabled:
+            return None
+        if hidden_states.is_cuda and self.ee_timing_mode == "sync":
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            return (start_event, end_event)
+        return time.perf_counter()
+
+    def _elapsed_timer(self, start_time):
+        if start_time is None:
+            return 0.0
+        if isinstance(start_time, tuple):
+            start_event, end_event = start_time
+            end_event.record()
+            end_event.synchronize()
+            return start_event.elapsed_time(end_event) / 1000.0
+        return time.perf_counter() - start_time
 
     def forward(
         self,
@@ -794,11 +834,14 @@ class LlamaDecoderLayer(nn.Module):
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
+        self.ee_last_attn_time_s = 0.0
+        self.ee_last_mlp_time_s = 0.0
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
+        attn_start = self._start_timer(hidden_states)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -808,12 +851,15 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
+        self.ee_last_attn_time_s = self._elapsed_timer(attn_start)
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        mlp_start = self._start_timer(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        self.ee_last_mlp_time_s = self._elapsed_timer(mlp_start)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -940,15 +986,12 @@ LLAMA_INPUTS_DOCSTRING = r"""
 """
 
 
-@add_start_docstrings(
-    "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
-    LLAMA_START_DOCSTRING,
-)
 
 
-class MLP(nn.Module):
+"""
+class MLPold(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
-        super(MLP, self).__init__()
+        super(MLPold, self).__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(hidden_size, output_size)
@@ -961,6 +1004,33 @@ class MLP(nn.Module):
         out = self.fc2(out)
         out = self.sigmoid(out)
         return out
+"""
+
+@add_start_docstrings(
+    "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
+    LLAMA_START_DOCSTRING,
+)
+
+
+
+class MLP(nn.Module):
+    """Simple 4-layer MLP with fc1->relu->fc2->sigmoid"""
+    def __init__(self, input_size, hidden_size, output_size):
+        super(MLP, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size, bias=False)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_size, output_size, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        """PyTorch-based forward pass using all 4 layers"""
+        out = self.fc1(x)
+        out = self.relu(out)
+        out = self.fc2(out)
+        out = self.sigmoid(out)
+        return out
+
+    
     
     
 class LlamaModel(LlamaPreTrainedModel):
@@ -970,6 +1040,12 @@ class LlamaModel(LlamaPreTrainedModel):
     Args:
         config: LlamaConfig
     """
+
+    # Class-level shared AIE MLP operators (created once, used by all instances)
+    mlp_ai_fc1 = None
+    mlp_ai_relu = None
+    mlp_ai_sigmoid = None
+    mlp_ai_fc2 = None
 
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
@@ -983,12 +1059,224 @@ class LlamaModel(LlamaPreTrainedModel):
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
 
         self.gradient_checkpointing = False
         self.layers_count = []
         self.predictors = None
         self.pred_thresholds = 0.5
+        self.ee_timing = {
+            "head_time_s": 0.0,
+            "head_calls": 0,
+            "forward_time_s": 0.0,
+            "forward_tokens": 0,
+            "lm_head_time_s": 0.0,
+            "lm_head_calls": 0,
+            "attn_time_s": 0.0,
+            "attn_calls": 0,
+            "mlp_time_s": 0.0,
+            "mlp_calls": 0,
+            "decoder_layer_time_s": 0.0,
+            "decoder_layer_calls": 0,
+            "predictor_time_s": 0.0,
+            "predictor_calls": 0,
+            "per_layer_time_s": [0.0 for _ in range(config.num_hidden_layers)],
+            "per_layer_calls": [0 for _ in range(config.num_hidden_layers)],
+            "per_layer_predictor_time_s": [0.0 for _ in range(config.num_hidden_layers)],
+            "per_layer_predictor_calls": [0 for _ in range(config.num_hidden_layers)],
+        }  # track detailed decode timing
+        self.ee_timing_enabled = True  # allow toggling head timing
+        self.ee_timing_mode = "sync"  # "sync" uses CUDA event sync, "perf" avoids sync barriers
+        self.ee_parallel_enabled = False  # overlap EE head/predictor with speculative next-layer compute
+        self.ee_parallel_clone_cache = True  # clone cache for speculative branch to preserve exact semantics
+        self.ee_parallel_prefetch_stride = 2  # launch speculative prefetch every N predictor checks when parallel mode is on
+        self.ee_debug_enabled = False  # disable gate-debug counters by default for perf
+        self.npu_enabled = True # whether the model is running on NPU (used to disable parallel EE which is not currently supported on NPU)
+        self.ee_debug = {
+            "selected_layers": 0,
+            "pred_pass": 0,
+            "token_match": 0,
+            "early_exit": 0,
+            "prefetch_launch": 0,
+            "prefetch_consume": 0,
+        }
         self.post_init()
+
+
+        if self.npu_enabled:
+            self.aie_norm = AIERMSNorm(
+                size = config.hidden_size,
+                eps = config.rms_norm_eps,
+                num_aie_columns=1,
+                num_channels = 2,
+                tile_size = config.hidden_size,
+                weighted = True
+            )
+            # Copy weights from regular norm to AIE norm
+            self.aie_norm.weight = torch.nn.Parameter(self.norm.weight.data.clone())
+            self.aie_linear = AIEGEMV(
+                M = 4,
+                K = config.hidden_size,
+                tile_size_input=1,
+                tile_size_output=2,
+                num_aie_columns=1,
+                is_mv=True,
+            )
+            self.aie_head_size = self.vocab_size
+            self.aie_lmhead = AIEGEMV(
+                M = config.vocab_size,
+                K = config.hidden_size,
+                tile_size_input=1,
+                tile_size_output=config.vocab_size // 16,
+                num_aie_columns=8,
+            )
+
+
+
+    """    
+    def _ensure_aie_runtime_ready(self):
+        if not self.npu_enabled:
+            return
+        context = AIEOperatorBase.get_default_context()
+        if not getattr(context, "_runtime_prepared", False):
+            context.compile_all()
+            context.prepare_runtime()
+
+    def _ensure_aie_linear_runtime_ready(self):
+        if not self.npu_enabled:
+            return
+
+        self._ensure_aie_runtime_ready()
+        if "matrix" in getattr(self.aie_linear, "buffer_bos", {}):
+            return
+
+        op = self.aie_linear
+        context = op.context
+
+        if op.xclbin_artifact is None or op.insts_artifact is None:
+            op.compile()
+
+        if len(op.kernels) == 0 or len(op.buffers) == 0:
+            op.set_up_runtime()
+
+        for kernel_name, (xclbin, xclbin_kernel_name, insts) in op.kernels.items():
+            if kernel_name in op.xrt_kernels:
+                continue
+            handle = context.device_manager.get_kernel_handle(
+                str(xclbin.path), xclbin_kernel_name, str(insts.path)
+            )
+            op.xrt_kernels[kernel_name] = (
+                handle.context,
+                handle.kernel,
+                handle.insts_bo,
+                len(handle.insts),
+            )
+
+        for buffer_name, buffer_size in op.buffers.items():
+            if buffer_name in op.buffer_bos:
+                continue
+            op.buffer_bos[buffer_name] = pyxrt.bo(
+                context.device_manager.device,
+                buffer_size,
+                pyxrt.bo.host_only,
+                0x10000,
+            )
+
+        op.xrt_runlist = None
+    """
+
+
+    def reset_ee_timing(self):  # reset early-exit timing counters
+        self.ee_timing["head_time_s"] = 0.0  # clear accumulated head time
+        self.ee_timing["head_calls"] = 0  # clear head call count
+        self.ee_timing["forward_time_s"] = 0.0  # clear accumulated per-token forward time
+        self.ee_timing["forward_tokens"] = 0  # clear per-token forward count
+        self.ee_timing["lm_head_time_s"] = 0.0  # clear accumulated lm_head runtime
+        self.ee_timing["lm_head_calls"] = 0  # clear lm_head call count
+        self.ee_timing["attn_time_s"] = 0.0  # clear attention runtime
+        self.ee_timing["attn_calls"] = 0  # clear attention call count
+        self.ee_timing["mlp_time_s"] = 0.0  # clear mlp runtime
+        self.ee_timing["mlp_calls"] = 0  # clear mlp call count
+        self.ee_timing["decoder_layer_time_s"] = 0.0  # clear decoder-layer runtime
+        self.ee_timing["decoder_layer_calls"] = 0  # clear decoder-layer call count
+        self.ee_timing["predictor_time_s"] = 0.0  # clear predictor runtime
+        self.ee_timing["predictor_calls"] = 0  # clear predictor call count
+        self.ee_timing["per_layer_time_s"] = [0.0 for _ in range(len(self.layers))]  # clear per-layer runtime
+        self.ee_timing["per_layer_calls"] = [0 for _ in range(len(self.layers))]  # clear per-layer call count
+        self.ee_timing["per_layer_predictor_time_s"] = [0.0 for _ in range(len(self.layers))]  # clear per-layer predictor runtime
+        self.ee_timing["per_layer_predictor_calls"] = [0 for _ in range(len(self.layers))]  # clear per-layer predictor calls
+
+    def _elapsed_ee_timer(self, start_time):  # compute elapsed time for perf-counter or CUDA events
+        if start_time is None:
+            return 0.0
+        if isinstance(start_time, tuple):  # CUDA event timing path
+            start_event, end_event = start_time  # unpack CUDA timing events
+            end_event.record()  # mark end of timed CUDA region
+            end_event.synchronize()  # wait for end event completion
+            return start_event.elapsed_time(end_event) / 1000.0  # convert ms to seconds
+        return time.perf_counter() - start_time  # compute elapsed wall time
+
+    def _record_ee_head_time(self, start_time):  # record per-head duration
+        if not self.ee_timing_enabled:  # skip timing when disabled
+            return  # skip timing when disabled
+        elapsed_s = self._elapsed_ee_timer(start_time)
+        self.ee_timing["head_time_s"] += elapsed_s  # accumulate head time
+        self.ee_timing["head_calls"] += 1  # count head invocation
+
+    def _record_ee_forward_token_time(self, start_time):  # record per-token forward-pass duration
+        if not self.ee_timing_enabled:  # skip timing when disabled
+            return  # skip timing when disabled
+        elapsed_s = self._elapsed_ee_timer(start_time)
+        self.ee_timing["forward_time_s"] += elapsed_s  # accumulate per-token forward time
+        self.ee_timing["forward_tokens"] += 1  # count one decode-token forward pass
+
+    def _record_ee_lm_head_time(self, start_time):  # record lm_head duration
+        if not self.ee_timing_enabled:  # skip timing when disabled
+            return  # skip timing when disabled
+        elapsed_s = self._elapsed_ee_timer(start_time)
+        self.ee_timing["lm_head_time_s"] += elapsed_s  # accumulate lm_head time
+        self.ee_timing["lm_head_calls"] += 1  # count lm_head invocation
+
+    def _start_ee_head_timer(self, hidden_states):
+        if not self.ee_timing_enabled:
+            return None
+        if hidden_states.is_cuda and self.ee_timing_mode == "sync":
+            ee_start_event = torch.cuda.Event(enable_timing=True)
+            ee_end_event = torch.cuda.Event(enable_timing=True)
+            ee_start_event.record()
+            return (ee_start_event, ee_end_event)
+        return time.perf_counter()
+
+    def _clone_cache_for_parallel(self, cache_obj):
+        if cache_obj is None:
+            return None
+        if isinstance(cache_obj, DynamicCache):
+            try:
+                cloned_cache = DynamicCache()
+                if hasattr(cache_obj, "key_cache"):
+                    cloned_cache.key_cache = list(cache_obj.key_cache)
+                if hasattr(cache_obj, "value_cache"):
+                    cloned_cache.value_cache = list(cache_obj.value_cache)
+                if hasattr(cache_obj, "seen_tokens"):
+                    cloned_cache.seen_tokens = cache_obj.seen_tokens
+                if hasattr(cache_obj, "_seen_tokens"):
+                    cloned_cache._seen_tokens = cache_obj._seen_tokens
+                return cloned_cache
+            except Exception:
+                pass
+        try:
+            return copy.deepcopy(cache_obj)
+        except Exception:
+            pass
+        if hasattr(cache_obj, "to_legacy_cache"):
+            try:
+                return DynamicCache.from_legacy_cache(cache_obj.to_legacy_cache())
+            except Exception:
+                return None
+        return None
+
+
+    
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1038,7 +1326,7 @@ class LlamaModel(LlamaPreTrainedModel):
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                    "`use_cache=True` is incompatible with gradient checkMatrix cols 12 do not match expected 1024 for this operator.pointing. Setting `use_cache=False`..."
                 )
                 use_cache = False
 
@@ -1076,13 +1364,18 @@ class LlamaModel(LlamaPreTrainedModel):
                 attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
             )
         hidden_states = inputs_embeds
+        ee_forward_start = None  # default per-token forward timing sentinel
+        if not init:  # time only decode-token forward passes
+            ee_forward_start = self._start_ee_head_timer(hidden_states)  # start per-token forward timer
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
+        current_past_key_values = past_key_values
         last_prob = None
-        dynamic_layers = [15,16,17,19,21,24,26,28]
+        # Heuristic predictor scheduling: fixed offline set + online context-nearby exits.
+        dynamic_layers = [15, 16, 17, 19, 21, 24, 26, 28]  # fixed offline predictors
         if len(exit_layer_id_list) >= 5:
             for x in exit_layer_id_list[-5:]:
                 for y in [-2,0,2]:
@@ -1091,31 +1384,77 @@ class LlamaModel(LlamaPreTrainedModel):
                         dynamic_layers.append(x + y - 1)
         layer_selected = dynamic_layers
         
+        prefetch_stream = None
+        prefetched_idx = -1
+        prefetched_layer_outputs = None
+        can_parallel_prefetch = (
+            self.ee_parallel_enabled
+            and torch.cuda.is_available()
+            and hidden_states.is_cuda
+            and not (self.gradient_checkpointing and self.training)
+        )
+        if can_parallel_prefetch:
+            prefetch_stream = torch.cuda.Stream(device=hidden_states.device)
+
+        ee_debug = None
+        if self.ee_debug_enabled:
+            ee_debug = {
+                "selected_layers": 0,
+                "pred_pass": 0,
+                "token_match": 0,
+                "early_exit": 0,
+                "prefetch_launch": 0,
+                "prefetch_consume": 0,
+            }
+        lm_head_weights_cpu = lm_head.weight.cpu().to(dtype=torch.bfloat16) if self.npu_enabled and lm_head is not None else None
         for idx,decoder_layer in enumerate(self.layers):
+            decoder_layer.ee_timing_enabled = self.ee_timing_enabled
+            decoder_layer.ee_timing_mode = self.ee_timing_mode
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                )
+            if prefetched_idx == idx:
+                torch.cuda.current_stream(hidden_states.device).wait_stream(prefetch_stream)
+                layer_outputs = prefetched_layer_outputs
+                if ee_debug is not None:
+                    ee_debug["prefetch_consume"] += 1
+                prefetched_idx = -1
+                prefetched_layer_outputs = None
             else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                )
+                layer_start = self._start_ee_head_timer(hidden_states)
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        current_past_key_values,
+                        output_attentions,
+                        use_cache,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=current_past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                    )
+                if not init and layer_start is not None:
+                    layer_elapsed_s = self._elapsed_ee_timer(layer_start)
+                    self.ee_timing["decoder_layer_time_s"] += layer_elapsed_s
+                    self.ee_timing["decoder_layer_calls"] += 1
+                    if idx < len(self.ee_timing["per_layer_time_s"]):
+                        self.ee_timing["per_layer_time_s"][idx] += layer_elapsed_s
+                        self.ee_timing["per_layer_calls"][idx] += 1
+                    self.ee_timing["attn_time_s"] += float(getattr(decoder_layer, "ee_last_attn_time_s", 0.0))
+                    self.ee_timing["attn_calls"] += 1
+                    self.ee_timing["mlp_time_s"] += float(getattr(decoder_layer, "ee_last_mlp_time_s", 0.0))
+                    self.ee_timing["mlp_calls"] += 1
             hidden_states = layer_outputs[0]       
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                current_past_key_values = next_decoder_cache
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -1123,26 +1462,124 @@ class LlamaModel(LlamaPreTrainedModel):
             if not init and idx <= len(self.layers):
                 if idx not in layer_selected:
                     continue
-                hidden_states_tmp = self.norm(hidden_states)
-                draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
-                draft_prob = F.softmax(draft_logits, dim=-1)
+                if ee_debug is not None:
+                    ee_debug["selected_layers"] += 1
+                # Speculative early-exit head: compute draft logits/prob/variation, run per-layer MLP, then verify.
+                ee_start = self._start_ee_head_timer(hidden_states)
+
+                next_idx = idx + 1
+                next_is_predictor_layer = next_idx in layer_selected
+                prefetch_stride = max(1, int(getattr(self, "ee_parallel_prefetch_stride", 1)))
+                should_prefetch_this_layer = (idx % prefetch_stride) == 0
+                if (
+                    can_parallel_prefetch
+
+                ):
+                    speculative_cache = next_decoder_cache
+                    can_launch_prefetch = True
+                    if use_cache and self.ee_parallel_clone_cache:
+                        speculative_cache = self._clone_cache_for_parallel(next_decoder_cache)
+                        if next_decoder_cache is not None and speculative_cache is None:
+                            can_launch_prefetch = False
+                    if can_launch_prefetch and not (use_cache and speculative_cache is next_decoder_cache and next_decoder_cache is not None):
+                        current_stream = torch.cuda.current_stream(hidden_states.device)
+                        #prefetch_stream.wait_stream(current_stream)
+                        with torch.cuda.stream(prefetch_stream):
+                            prefetched_layer_outputs = self.layers[next_idx](
+                                hidden_states,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                past_key_value=speculative_cache,
+                                output_attentions=output_attentions,
+                                use_cache=use_cache,
+                            )
+                        prefetched_idx = next_idx
+                        if ee_debug is not None:
+                            ee_debug["prefetch_launch"] += 1
+
+                #npu stuff
+                if self.npu_enabled:
+                    #self._ensure_aie_linear_runtime_ready()
+                    hidden_states_cpu = hidden_states.cpu().to(dtype=torch.bfloat16)
+                    draft_lm_head_weight_cpu = draft_lm_head_weight.cpu().to(dtype=torch.bfloat16)
+                    # Copy weights from regular norm to AIE norm
+                    self.aie_norm.weight = self.norm.weight.to(torch.bfloat16)
+                    hidden_states_tmp_cpu = self.aie_norm.forward(hidden_states_cpu)
+                    #draft_lm_head_weight_cpu = draft_lm_head_weight_cpu.reshape(-1, draft_lm_head_weight_cpu.shape[-1])
+                    if draft_lm_head_weight_cpu.shape[0] != self.aie_linear.M:
+                        raise RuntimeError(
+                            f"AIE linear expects {self.aie_linear.M} draft rows, got {draft_lm_head_weight_cpu.shape[0]}"
+                        )
+                    draft_logits = self.aie_linear.forward(hidden_states_tmp_cpu, draft_lm_head_weight_cpu)
+                    
+                    draft_prob = F.softmax(draft_logits, dim=-1)
+
+                else:
+                    hidden_states_tmp = self.norm(hidden_states)
+                    draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
+                    draft_prob = F.softmax(draft_logits, dim=-1)
+
+
+
                 if last_prob is None:
                     prob_gap = draft_prob
                 else:
                     prob_gap = draft_prob - last_prob
                 last_prob = draft_prob
+
+
                 if len(self.layers) == 32:
+                    
                     feature = torch.cat([draft_logits,draft_prob,prob_gap],dim=-1).squeeze(0)
                 else:
                     feature = torch.cat([hidden_states_tmp,draft_logits,draft_prob],dim=-1).squeeze(0)
+                
+                pred_start = self._start_ee_head_timer(feature)
+                
+
+                # Execute predictor with NPU acceleration if available
+                feature = feature.to(device=hidden_states.device, dtype=hidden_states.dtype) if self.npu_enabled else feature
                 pred = self.predictors[idx](feature)
+                print(self.predictors[idx].fc1.weight.shape, self.predictors[idx].fc2.weight.shape)
+                if pred_start is not None:
+                    pred_elapsed_s = self._elapsed_ee_timer(pred_start)
+                    self.ee_timing["predictor_time_s"] += pred_elapsed_s
+                    self.ee_timing["predictor_calls"] += 1
+                    if idx < len(self.ee_timing["per_layer_predictor_time_s"]):
+                        self.ee_timing["per_layer_predictor_time_s"][idx] += pred_elapsed_s
+                        self.ee_timing["per_layer_predictor_calls"][idx] += 1
+
+
+                #if ee_start is not None:  # timing guard for early exit
+                #    self._record_ee_head_time(ee_start) 
+
                 if pred > self.pred_thresholds:
+                    if ee_debug is not None:
+                        ee_debug["pred_pass"] += 1
+                    if self.npu_enabled:
+                        hidden_states_tmp = hidden_states_tmp_cpu.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                    lm_head_start = self._start_ee_head_timer(hidden_states_tmp)  # start lm_head timer for verification path
+                    
+                    #logits_cpu = self.aie_lmhead.forward(hidden_states_tmp_cpu, lm_head_weights_cpu)
                     logits = lm_head(hidden_states_tmp)
+                    if lm_head_start is not None:  # timing guard for verification lm_head
+                        self._record_ee_lm_head_time(lm_head_start)  # record verification lm_head time
                     token = torch.argmax(logits[:, -1])
                     token = token[None, None]
                     # if token == input_ids[-1]:
-                    #     continue
-                    if token in draft_token_index:
+                    #     continue 
+
+                    if torch.eq(draft_token_index, token).any():
+                        if ee_debug is not None:
+                            ee_debug["token_match"] += 1
+                        #if can_parallel_prefetch and prefetch_stream is not None:
+                            #torch.cuda.current_stream(hidden_states.device).wait_stream(prefetch_stream)
+                        prefetched_idx = -1
+                        prefetched_layer_outputs = None
+
+                        if ee_debug is not None:
+                            ee_debug["early_exit"] += 1
+                            self.ee_debug = ee_debug
                         exit_layer_id_list.append(idx+1)
                         hidden_states = hidden_states_tmp
                         if output_hidden_states:
@@ -1151,15 +1588,29 @@ class LlamaModel(LlamaPreTrainedModel):
                         if use_cache:
                             next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
                         if not return_dict:
+                            if ee_forward_start is not None:  # timing guard for tuple return path
+                                self._record_ee_forward_token_time(ee_forward_start)  # record per-token forward time
                             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+                        if ee_forward_start is not None:  # timing guard for dict return path
+                            self._record_ee_forward_token_time(ee_forward_start)  # record per-token forward time
                         return BaseModelOutputWithPast(
                             last_hidden_state=hidden_states,
                             past_key_values=next_cache,
                             hidden_states=all_hidden_states,
                             attentions=all_self_attns,
                         ), token
+                    if ee_start is not None:  # timing guard for early exit
+                        self._record_ee_head_time(ee_start)  # record head time on early exit
+                else:
+                    if ee_start is not None:  # timing guard for non-exit path
+                        self._record_ee_head_time(ee_start)  # record head time on non-exit path
+        if can_parallel_prefetch and prefetch_stream is not None and prefetched_idx != -1:
+            torch.cuda.current_stream(hidden_states.device).wait_stream(prefetch_stream)
         hidden_states = self.norm(hidden_states)
+        lm_head_start = self._start_ee_head_timer(hidden_states)  # start lm_head timer for final-token path
         logits = lm_head(hidden_states)
+        if lm_head_start is not None:  # timing guard for final lm_head
+            self._record_ee_lm_head_time(lm_head_start)  # record final lm_head time
         token = torch.argmax(logits[:, -1])
         token = token[None, None]
         # add hidden states from the last decoder layer
@@ -1169,8 +1620,16 @@ class LlamaModel(LlamaPreTrainedModel):
         if use_cache:
             next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
         if not return_dict:
+            if ee_debug is not None:
+                self.ee_debug = ee_debug
+            if ee_forward_start is not None:  # timing guard for tuple return path
+                self._record_ee_forward_token_time(ee_forward_start)  # record per-token forward time
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+        if ee_debug is not None:
+            self.ee_debug = ee_debug
         exit_layer_id_list.append(idx+1)
+        if ee_forward_start is not None:  # timing guard for final return path
+            self._record_ee_forward_token_time(ee_forward_start)  # record per-token forward time
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -1200,7 +1659,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     def get_output_embeddings(self):
         return self.lm_head
 
-    def set_output_embeddings(self, new_embeddings):
+    def set_output_embeddings(self, newaie_embeddings):
         self.lm_head = new_embeddings
 
     def set_decoder(self, decoder):

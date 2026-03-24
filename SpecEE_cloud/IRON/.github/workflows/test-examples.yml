@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Test Example Applications
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - devel
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Test:
+    runs-on: [self-hosted, docker]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        env:
+          HOME: /workspace
+
+      - name: Prerequisites
+        uses: ./.github/actions/prereqs
+        with:
+          env_name: ci_env
+
+      - name: Install additional requirements for examples
+        shell: bash
+        env:
+          HOME: /workspace
+        run: |
+          set -euxo pipefail
+          source ci_env/bin/activate
+          pip install -r requirements_examples.txt
+
+      - name: Run examples
+        id: test
+        continue-on-error: true
+        uses: ./.github/actions/test
+        with:
+          env_name: ci_env
+          test_suite: "applications"
+          test_flags: "--iterations 1"
+
+      - name: Commit example test results
+        uses: ./.github/actions/commit_results
+        id: commit_results
+        with:
+          dir: examples
+          pretty_flags: "--metric='TTFT (mean)' --metric='TPS (mean)' -o pretty.md"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-examples
+          path: ${{ steps.commit_results.outputs.results_dir }}
+          retention-days: 14
+
+      - name: Fail workflow if examples failed
+        if: steps.test.outcome == 'failure'
+        run: exit 1
