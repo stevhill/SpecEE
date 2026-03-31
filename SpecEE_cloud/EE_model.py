@@ -100,18 +100,27 @@ class EEModel(nn.Module):
             base_model.model.npu_enabled = npu_enabled
 
         base_model.model.predictors = [torch.load(predictor_path+'/model'+str(layer_idx)+'.pth',weights_only=False).to(torch.float16) for layer_idx in range(len(base_model.model.layers))]
-        aie_predictors = []
-        for idx, predictor in enumerate(base_model.model.predictors):
 
-            aie_predictors.append(AIEPredictorMLP(
-                input_size=predictor.fc1.in_features,
-                hidden_size=predictor.fc1.out_features,
-                output_size=2,
-                num_aie_columns=1,
-                layer_idx=idx,
-            ))
-            aie_predictors[-1].set_weights(predictor.fc1.weight.data, predictor.fc2.weight.data)
-        base_model.model.aie_predictors = aie_predictors  # store AIE Predictor MLPs
+        # One shared AIE predictor operator; per-layer weights are passed at runtime.
+        first_predictor = base_model.model.predictors[0]
+        shared_aie_predictor = AIEPredictorMLP(
+            input_size=first_predictor.fc1.in_features,
+            hidden_size=first_predictor.fc1.out_features,
+            output_size=2,
+            num_aie_columns=1,
+        )
+        base_model.model.aie_predictor = shared_aie_predictor
+        base_model.model.aie_predictors = None
+
+        # Pre-pad per-layer weights once and reuse during decode.
+        aie_predictor_weights_padded = []
+        for predictor in base_model.model.predictors:
+            fc1_w_padded, fc2_w_padded = shared_aie_predictor._pad_weights(
+                predictor.fc1.weight.data.cpu(),
+                predictor.fc2.weight.data.cpu(),
+            )
+            aie_predictor_weights_padded.append((fc1_w_padded, fc2_w_padded))
+        base_model.model.aie_predictor_weights_padded = aie_predictor_weights_padded
         base_model.model.pred_thresholds = pred_thresholds
         base_model.model.ee_parallel_enabled = ee_parallel_enabled
         base_model.model.ee_timing_mode = ee_timing_mode

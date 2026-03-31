@@ -986,24 +986,6 @@ LLAMA_INPUTS_DOCSTRING = r"""
 
 
 
-"""
-class MLPold(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(MLPold, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_size, output_size)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        # breakpoint()
-        out = self.fc1(x)
-        out = self.relu(out)
-        out = self.fc2(out)
-        out = self.sigmoid(out)
-        return out
-"""
-
 @add_start_docstrings(
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
@@ -1063,6 +1045,8 @@ class LlamaModel(LlamaPreTrainedModel):
         self.layers_count = []
         self.predictors = None
         self.aie_predictors = None
+        self.aie_predictor = None
+        self.aie_predictor_weights_padded = None
         self.pred_thresholds = 0.5
         self.ee_timing = {
             "head_time_s": 0.0,
@@ -1090,7 +1074,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.ee_parallel_clone_cache = True  # clone cache for speculative branch to preserve exact semantics
         self.ee_parallel_prefetch_stride = 2  # launch speculative prefetch every N predictor checks when parallel mode is on
         self.ee_debug_enabled = False  # disable gate-debug counters by default for perf
-        self.npu_enabled = True # whether the model is running on NPU (used to disable parallel EE which is not currently supported on NPU)
+        self.npu_enabled = True # whether the model is running on NPU; when True and ee_parallel_enabled, GPU next-layer runs on prefetch_stream while CPU blocks on NPU predictor
         self.ee_debug = {
             "selected_layers": 0,
             "pred_pass": 0,
@@ -1129,7 +1113,13 @@ class LlamaModel(LlamaPreTrainedModel):
                 tile_size_output=config.vocab_size // 16,
                 num_aie_columns=8,
             )
-
+    def cpu_forward(self, x,fc1_weight,fc2_weight):
+        """PyTorch-based forward pass using all 4 layers"""
+        fc1 = F.linear(x, fc1_weight)
+        relu = F.relu(fc1)
+        fc2 = F.linear(relu, fc2_weight)
+        sigmoid = F.sigmoid(fc2)
+        return sigmoid    
 
 
 
@@ -1441,12 +1431,13 @@ KeyError: 'input'
                 "prefetch_launch": 0,
                 "prefetch_consume": 0,
             }
-        lm_head_weights_cpu = lm_head.weight.cpu().to(dtype=torch.bfloat16) if self.npu_enabled and lm_head is not None else None
+        draft_lm_head_weight_cpu = draft_lm_head_weight.cpu().to(dtype=torch.bfloat16) if self.npu_enabled and draft_lm_head_weight is not None else None
         for idx,decoder_layer in enumerate(self.layers):
             decoder_layer.ee_timing_enabled = self.ee_timing_enabled
             decoder_layer.ee_timing_mode = self.ee_timing_mode
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+            layer_start = self._start_ee_head_timer(hidden_states)
             if prefetched_idx == idx:
                 torch.cuda.current_stream(hidden_states.device).wait_stream(prefetch_stream)
                 layer_outputs = prefetched_layer_outputs
@@ -1455,7 +1446,7 @@ KeyError: 'input'
                 prefetched_idx = -1
                 prefetched_layer_outputs = None
             else:
-                layer_start = self._start_ee_head_timer(hidden_states)
+
                 if self.gradient_checkpointing and self.training:
                     layer_outputs = self._gradient_checkpointing_func(
                         decoder_layer.__call__,
@@ -1475,17 +1466,17 @@ KeyError: 'input'
                         output_attentions=output_attentions,
                         use_cache=use_cache,
                     )
-                if not init and layer_start is not None:
-                    layer_elapsed_s = self._elapsed_ee_timer(layer_start)
-                    self.ee_timing["decoder_layer_time_s"] += layer_elapsed_s
-                    self.ee_timing["decoder_layer_calls"] += 1
-                    if idx < len(self.ee_timing["per_layer_time_s"]):
-                        self.ee_timing["per_layer_time_s"][idx] += layer_elapsed_s
-                        self.ee_timing["per_layer_calls"][idx] += 1
-                    self.ee_timing["attn_time_s"] += float(getattr(decoder_layer, "ee_last_attn_time_s", 0.0))
-                    self.ee_timing["attn_calls"] += 1
-                    self.ee_timing["mlp_time_s"] += float(getattr(decoder_layer, "ee_last_mlp_time_s", 0.0))
-                    self.ee_timing["mlp_calls"] += 1
+            if not init and layer_start is not None:
+                layer_elapsed_s = self._elapsed_ee_timer(layer_start)
+                self.ee_timing["decoder_layer_time_s"] += layer_elapsed_s
+                self.ee_timing["decoder_layer_calls"] += 1
+                if idx < len(self.ee_timing["per_layer_time_s"]):
+                    self.ee_timing["per_layer_time_s"][idx] += layer_elapsed_s
+                    self.ee_timing["per_layer_calls"][idx] += 1
+                self.ee_timing["attn_time_s"] += float(getattr(decoder_layer, "ee_last_attn_time_s", 0.0))
+                self.ee_timing["attn_calls"] += 1
+                self.ee_timing["mlp_time_s"] += float(getattr(decoder_layer, "ee_last_mlp_time_s", 0.0))
+                self.ee_timing["mlp_calls"] += 1
             hidden_states = layer_outputs[0]       
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -1493,7 +1484,8 @@ KeyError: 'input'
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-                
+            _t0 = time.perf_counter()
+            _t1 = time.perf_counter()
             if not init and idx <= len(self.layers):
                 if idx not in layer_selected:
                     continue
@@ -1508,17 +1500,18 @@ KeyError: 'input'
                 should_prefetch_this_layer = (idx % prefetch_stride) == 0
                 if (
                     can_parallel_prefetch
-
+                    and next_idx < len(self.layers)
                 ):
                     speculative_cache = next_decoder_cache
                     can_launch_prefetch = True
-                    if use_cache and self.ee_parallel_clone_cache:
+                    if use_cache:
                         speculative_cache = self._clone_cache_for_parallel(next_decoder_cache)
                         if next_decoder_cache is not None and speculative_cache is None:
                             can_launch_prefetch = False
                     if can_launch_prefetch and not (use_cache and speculative_cache is next_decoder_cache and next_decoder_cache is not None):
                         current_stream = torch.cuda.current_stream(hidden_states.device)
-                        #prefetch_stream.wait_stream(current_stream)
+                        prefetch_stream.wait_stream(current_stream)
+                    
                         with torch.cuda.stream(prefetch_stream):
                             prefetched_layer_outputs = self.layers[next_idx](
                                 hidden_states,
@@ -1529,27 +1522,33 @@ KeyError: 'input'
                                 use_cache=use_cache,
                             )
                         prefetched_idx = next_idx
+                        
+                        prefetch_done_event = torch.cuda.Event()
+                        _t0 = time.perf_counter()
+                        prefetch_stream.record_event(prefetch_done_event)
+                                            
+                        _t1 = time.perf_counter()
+                        print(f"[PARALLEL DEBUG] layer={idx} cpu() took {(_t1-_t0)*1000:.1f}ms, GPU prefetch done before cpu() finished: {prefetch_done_event.query() if 'prefetch_done_event' in dir() else 'no prefetch'}", flush=True)
                         if ee_debug is not None:
                             ee_debug["prefetch_launch"] += 1
 
                 #npu stuff
                 if self.npu_enabled:
+                    pred_start = self._start_ee_head_timer(hidden_states)
                     #self._ensure_aie_linear_runtime_ready()
+
+                    print(f"[PARALLEL DEBUG] layer={idx} cpu() took {(_t1-_t0)*1000:.1f}ms, GPU prefetch done before cpu() finished: {prefetch_done_event.query() if 'prefetch_done_event' in dir() else 'no prefetch'}", flush=True)
                     hidden_states_cpu = hidden_states.cpu().to(dtype=torch.bfloat16)
-                    draft_lm_head_weight_cpu = draft_lm_head_weight.cpu().to(dtype=torch.bfloat16)
-                    # Copy weights from regular norm to AIE norm
-                    self.aie_norm.weight = self.norm.weight.to(torch.bfloat16)
+                    
+
+                    
+
                     hidden_states_tmp_cpu = self.aie_norm.forward(hidden_states_cpu)
                     #draft_lm_head_weight_cpu = draft_lm_head_weight_cpu.reshape(-1, draft_lm_head_weight_cpu.shape[-1])
-                    if draft_lm_head_weight_cpu.shape[0] != self.aie_linear.M:
-                        raise RuntimeError(
-                            f"AIE linear expects {self.aie_linear.M} draft rows, got {draft_lm_head_weight_cpu.shape[0]}"
-                        )
                     draft_logits = self.aie_linear.forward(hidden_states_tmp_cpu, draft_lm_head_weight_cpu)
                     
                     draft_prob = F.softmax(draft_logits, dim=-1)
 
-                    
                     if last_prob is None:
                         prob_gap = draft_prob
                     else:
@@ -1562,17 +1561,21 @@ KeyError: 'input'
                     else:
                         feature = torch.cat([hidden_states_tmp,draft_logits,draft_prob],dim=-1).squeeze(0)
                     
-                    pred_start = self._start_ee_head_timer(feature)
+                    
 
-                    pred = self.aie_predictors[idx].forward(feature)
+                    fc1_weight_padded, fc2_weight_padded = self.aie_predictor_weights_padded[idx]
+                    pred = self.aie_predictor.forward(feature,fc1_weight_padded,fc2_weight_padded,)
+                    #pred = self.cpu_forward(feature, fc1_weight_padded, fc2_weight_padded)[0]
+                    time.sleep(0.001)  # simulate some CPU compute overhead for the predictor
 
                 else:
+                    pred_start = self._start_ee_head_timer(hidden_states)
                     hidden_states_tmp = self.norm(hidden_states)
+
                     draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
                     draft_prob = F.softmax(draft_logits, dim=-1)
 
 
-
                     if last_prob is None:
                         prob_gap = draft_prob
                     else:
@@ -1586,7 +1589,7 @@ KeyError: 'input'
                     else:
                         feature = torch.cat([hidden_states_tmp,draft_logits,draft_prob],dim=-1).squeeze(0)
                     
-                    pred_start = self._start_ee_head_timer(feature)
+                    
                     
 
                     # Execute predictor with NPU acceleration if available
@@ -1613,7 +1616,7 @@ KeyError: 'input'
                     if self.npu_enabled:
                         hidden_states_tmp = hidden_states_tmp_cpu.to(device=hidden_states.device, dtype=hidden_states.dtype)
                     lm_head_start = self._start_ee_head_timer(hidden_states_tmp)  # start lm_head timer for verification path
-                    
+
                     #logits_cpu = self.aie_lmhead.forward(hidden_states_tmp_cpu, lm_head_weights_cpu)
                     logits = lm_head(hidden_states_tmp)
                     if lm_head_start is not None:  # timing guard for verification lm_head
