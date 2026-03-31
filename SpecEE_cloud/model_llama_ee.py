@@ -1523,12 +1523,7 @@ KeyError: 'input'
                             )
                         prefetched_idx = next_idx
                         
-                        prefetch_done_event = torch.cuda.Event()
-                        _t0 = time.perf_counter()
-                        prefetch_stream.record_event(prefetch_done_event)
-                                            
-                        _t1 = time.perf_counter()
-                        print(f"[PARALLEL DEBUG] layer={idx} cpu() took {(_t1-_t0)*1000:.1f}ms, GPU prefetch done before cpu() finished: {prefetch_done_event.query() if 'prefetch_done_event' in dir() else 'no prefetch'}", flush=True)
+
                         if ee_debug is not None:
                             ee_debug["prefetch_launch"] += 1
 
@@ -1536,8 +1531,6 @@ KeyError: 'input'
                 if self.npu_enabled:
                     pred_start = self._start_ee_head_timer(hidden_states)
                     #self._ensure_aie_linear_runtime_ready()
-
-                    print(f"[PARALLEL DEBUG] layer={idx} cpu() took {(_t1-_t0)*1000:.1f}ms, GPU prefetch done before cpu() finished: {prefetch_done_event.query() if 'prefetch_done_event' in dir() else 'no prefetch'}", flush=True)
                     hidden_states_cpu = hidden_states.cpu().to(dtype=torch.bfloat16)
                     
 
