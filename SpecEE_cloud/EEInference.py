@@ -156,7 +156,7 @@ def main(args):
                         ee_debug_totals[key] += int(ee_debug.get(key, 0))
             output_ids_tot += len(output_ids[0]) - seqlen
             output=model.tokenizer.decode(output_ids[0])
-            if i >=2:
+            if i >=5:
                 break
         ed = time.time()
         spec = output_ids_tot/(ed-st)

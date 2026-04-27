@@ -1411,7 +1411,9 @@ KeyError: 'input'
         
         prefetch_stream = None
         prefetched_idx = -1
-        prefetched_layer_outputs = None
+        prefetch_future = None
+        _last_pred_exit = False
+        copy_done_event = None
         can_parallel_prefetch = (
             self.ee_parallel_enabled
             and torch.cuda.is_available()
@@ -1420,6 +1422,11 @@ KeyError: 'input'
         )
         if can_parallel_prefetch:
             prefetch_stream = torch.cuda.Stream(device=hidden_states.device)
+            if not hasattr(self, '_prefetch_executor') or self._prefetch_executor is None:
+                import concurrent.futures
+                self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            if not hasattr(self, '_copy_stream') or self._copy_stream is None:
+                self._copy_stream = torch.cuda.Stream(device=hidden_states.device)
 
         ee_debug = None
         if self.ee_debug_enabled:
@@ -1439,12 +1446,12 @@ KeyError: 'input'
                 all_hidden_states += (hidden_states,)
             layer_start = self._start_ee_head_timer(hidden_states)
             if prefetched_idx == idx:
+                layer_outputs = prefetch_future.result()  # wait for Python dispatch to finish
                 torch.cuda.current_stream(hidden_states.device).wait_stream(prefetch_stream)
-                layer_outputs = prefetched_layer_outputs
                 if ee_debug is not None:
                     ee_debug["prefetch_consume"] += 1
                 prefetched_idx = -1
-                prefetched_layer_outputs = None
+                prefetch_future = None
             else:
 
                 if self.gradient_checkpointing and self.training:
@@ -1484,8 +1491,6 @@ KeyError: 'input'
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-            _t0 = time.perf_counter()
-            _t1 = time.perf_counter()
             if not init and idx <= len(self.layers):
                 if idx not in layer_selected:
                     continue
@@ -1494,13 +1499,27 @@ KeyError: 'input'
                 # Speculative early-exit head: compute draft logits/prob/variation, run per-layer MLP, then verify.
                 ee_start = self._start_ee_head_timer(hidden_states)
 
+                # Start async GPU→CPU copy of hidden_states immediately onto _copy_stream,
+                # before GPU dispatch thread launches, so DMA overlaps with both.
+
+                if can_parallel_prefetch and self.npu_enabled:
+                    if not hasattr(self, '_hidden_states_pinned') or self._hidden_states_pinned is None or self._hidden_states_pinned.shape != hidden_states.shape:
+                        self._hidden_states_pinned = torch.empty(hidden_states.shape, dtype=torch.bfloat16, pin_memory=True)
+                    _cs = torch.cuda.current_stream(hidden_states.device)
+                    self._copy_stream.wait_stream(_cs)
+                    with torch.cuda.stream(self._copy_stream):
+                        self._hidden_states_pinned.copy_(hidden_states.to(torch.bfloat16), non_blocking=True)
+                    copy_done_event = torch.cuda.Event(enable_timing=False)
+                    copy_done_event.record(self._copy_stream)
+
                 next_idx = idx + 1
-                next_is_predictor_layer = next_idx in layer_selected
-                prefetch_stride = max(1, int(getattr(self, "ee_parallel_prefetch_stride", 1)))
-                should_prefetch_this_layer = (idx % prefetch_stride) == 0
+                is_last_layer = idx == (len(self.layers) - 1)
+
+
+ 
                 if (
                     can_parallel_prefetch
-                    and next_idx < len(self.layers)
+                    and not _last_pred_exit
                 ):
                     speculative_cache = next_decoder_cache
                     can_launch_prefetch = True
@@ -1509,18 +1528,21 @@ KeyError: 'input'
                         if next_decoder_cache is not None and speculative_cache is None:
                             can_launch_prefetch = False
                     if can_launch_prefetch and not (use_cache and speculative_cache is next_decoder_cache and next_decoder_cache is not None):
-                        current_stream = torch.cuda.current_stream(hidden_states.device)
-                        prefetch_stream.wait_stream(current_stream)
-                    
-                        with torch.cuda.stream(prefetch_stream):
-                            prefetched_layer_outputs = self.layers[next_idx](
-                                hidden_states,
-                                attention_mask=attention_mask,
-                                position_ids=position_ids,
-                                past_key_value=speculative_cache,
-                                output_attentions=output_attentions,
-                                use_cache=use_cache,
-                            )
+                        _cs = torch.cuda.current_stream(hidden_states.device)
+                        _h, _am, _pi, _sc, _ni = hidden_states, attention_mask, position_ids, speculative_cache, next_idx
+                        _oa, _uc = output_attentions, use_cache
+                        def _gpu_dispatch(_cs=_cs, _h=_h, _am=_am, _pi=_pi, _sc=_sc, _ni=_ni, _oa=_oa, _uc=_uc):
+                            prefetch_stream.wait_stream(_cs)
+                            with torch.cuda.stream(prefetch_stream):
+                                return self.layers[_ni](
+                                    _h,
+                                    attention_mask=_am,
+                                    position_ids=_pi,
+                                    past_key_value=_sc,
+                                    output_attentions=_oa,
+                                    use_cache=_uc,
+                                )
+                        prefetch_future = self._prefetch_executor.submit(_gpu_dispatch)
                         prefetched_idx = next_idx
                         
 
@@ -1531,7 +1553,15 @@ KeyError: 'input'
                 if self.npu_enabled:
                     pred_start = self._start_ee_head_timer(hidden_states)
                     #self._ensure_aie_linear_runtime_ready()
-                    hidden_states_cpu = hidden_states.cpu().to(dtype=torch.bfloat16)
+
+                    if can_parallel_prefetch:
+                        if copy_done_event is not None:
+                            copy_done_event.synchronize()
+                        else:
+                            self._copy_stream.synchronize()
+                        hidden_states_cpu = self._hidden_states_pinned
+                    else:
+                        hidden_states_cpu = hidden_states.cpu().to(dtype=torch.bfloat16)
                     
 
                     
@@ -1541,7 +1571,13 @@ KeyError: 'input'
                     draft_logits = self.aie_linear.forward(hidden_states_tmp_cpu, draft_lm_head_weight_cpu)
                     
                     draft_prob = F.softmax(draft_logits, dim=-1)
+                    """
+                    hidden_states_tmp = self.norm(hidden_states)
 
+                    draft_logits = F.linear(hidden_states_tmp, draft_lm_head_weight)
+                    draft_prob = F.softmax(draft_logits, dim=-1) 
+                    draft_prob.cpu().to(dtype=torch.bfloat16)
+                    """
                     if last_prob is None:
                         prob_gap = draft_prob
                     else:
@@ -1549,17 +1585,19 @@ KeyError: 'input'
                     last_prob = draft_prob
 
                     if len(self.layers) == 32:
-                        
-                        feature = torch.cat([draft_logits,draft_prob,prob_gap],dim=-1).squeeze(0)
+                        _n = draft_logits.numel()
+                        if not hasattr(self, '_feature_buf') or self._feature_buf.numel() != 3 * _n or self._feature_buf.dtype != draft_logits.dtype:
+                            self._feature_buf = torch.empty(3 * _n, dtype=draft_logits.dtype)
+                        self._feature_buf[:_n].copy_(draft_logits.view(-1))
+                        self._feature_buf[_n:2*_n].copy_(draft_prob.view(-1))
+                        self._feature_buf[2*_n:].copy_(prob_gap.view(-1))
+                        feature = self._feature_buf
                     else:
                         feature = torch.cat([hidden_states_tmp,draft_logits,draft_prob],dim=-1).squeeze(0)
-                    
-                    
 
                     fc1_weight_padded, fc2_weight_padded = self.aie_predictor_weights_padded[idx]
                     pred = self.aie_predictor.forward(feature,fc1_weight_padded,fc2_weight_padded,)
                     #pred = self.cpu_forward(feature, fc1_weight_padded, fc2_weight_padded)[0]
-                    time.sleep(0.001)  # simulate some CPU compute overhead for the predictor
 
                 else:
                     pred_start = self._start_ee_head_timer(hidden_states)
@@ -1591,6 +1629,7 @@ KeyError: 'input'
                 # AIEPredictorMLP returns [output_size=2]; take index 0 (padded second row is unused)
                 if hasattr(pred, '__len__') and len(pred) > 1:
                     pred = pred[0]
+                _last_pred_exit = bool(pred > self.pred_thresholds) if self.pred_thresholds is not None else False
                 if pred_start is not None:
                     pred_elapsed_s = self._elapsed_ee_timer(pred_start)
                     self.ee_timing["predictor_time_s"] += pred_elapsed_s
@@ -1625,7 +1664,7 @@ KeyError: 'input'
                         #if can_parallel_prefetch and prefetch_stream is not None:
                             #torch.cuda.current_stream(hidden_states.device).wait_stream(prefetch_stream)
                         prefetched_idx = -1
-                        prefetched_layer_outputs = None
+                        prefetch_future = None
 
                         if ee_debug is not None:
                             ee_debug["early_exit"] += 1
